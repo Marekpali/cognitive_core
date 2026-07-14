@@ -1,0 +1,25 @@
+version: '3.8'
+services:
+  cognitive_core:
+    build: .
+    container_name: cognitive_core
+    restart: unless-stopped
+    environment:
+      - HA_HOST=172.22.10.191
+      - HA_TOKEN=${HA_TOKEN}
+      - USE_MOCK=false
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8000:8000"
+  zigbee2mqtt:
+    image: koenkk/zigbee2mqtt
+    container_name: zigbee2mqtt
+    restart: unless-stopped
+    volumes:
+      - ./zigbee2mqtt-data:/app/data
+    ports:
+      - "8080:8080"
+    environment:
+      - TZ=Europe/Warsaw

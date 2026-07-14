@@ -1,0 +1,33 @@
+homeassistant:
+  enabled: true
+mqtt:
+  base_topic: zigbee2mqtt
+  server: mqtt://172.22.10.191:1883
+  user: homeassistant
+  password: Polnocna17!
+serial:
+  port: tcp://172.22.10.88:6638
+  adapter: zstack
+frontend:
+  enabled: true
+  port: 8080
+advanced:
+  network_key:
+    - 79
+    - 242
+    - 42
+    - 99
+    - 125
+    - 128
+    - 136
+    - 67
+    - 55
+    - 229
+    - 225
+    - 186
+    - 125
+    - 26
+    - 105
+    - 211
+  log_level: info
+version: 5

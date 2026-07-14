@@ -1,0 +1,30 @@
+[2026-07-11 00:20:48] info: 	z2m: Logging to console, file (filename: log.log)
+[2026-07-11 00:20:49] info: 	z2m: Starting Zigbee2MQTT version 2.12.1 (commit #aa909a8a62f76e2dd98ace3a172bca88ee56f5fe
+)
+[2026-07-11 00:20:49] info: 	z2m: Starting zigbee-herdsman (10.6.1)
+[2026-07-11 00:20:49] info: 	zh:zstack:znp: Opening TCP socket with 172.22.10.88:6638
+[2026-07-11 00:20:49] info: 	zh:zstack:znp: Socket connected
+[2026-07-11 00:20:49] info: 	zh:zstack:znp: Socket ready
+[2026-07-11 00:20:49] info: 	zh:zstack:znp: Writing CC2530/CC2531 skip bootloader payload
+[2026-07-11 00:20:50] info: 	zh:zstack:znp: Skip bootloader for CC2652/CC1352
+[2026-07-11 00:22:38] error: 	z2m: Error while starting zigbee-herdsman
+[2026-07-11 00:22:38] error: 	z2m: Failed to start zigbee-herdsman
+[2026-07-11 00:22:38] error: 	z2m: Check https://www.zigbee2mqtt.io/guide/installation/20_zigbee2mqtt-fails-to-start_crashes-runtime.html for possible solutions
+[2026-07-11 00:22:38] error: 	z2m: Exiting...
+[2026-07-11 00:22:38] error: 	z2m: Error: network commissioning timed out - most likely network with the same panId or extendedPanId already exists nearby (Error: AREQ - ZDO - stateChangeInd after 100000ms
+    at Object.start (/app/node_modules/.pnpm/zigbee-herdsman@10.6.1/node_modules/zigbee-herdsman/src/utils/waitress.ts:68:23)
+    at ZnpAdapterManager.beginCommissioning (/app/node_modules/.pnpm/zigbee-herdsman@10.6.1/node_modules/zigbee-herdsman/src/adapter/z-stack/adapter/manager.ts:376:31)
+    at processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at ZnpAdapterManager.start (/app/node_modules/.pnpm/zigbee-herdsman@10.6.1/node_modules/zigbee-herdsman/src/adapter/z-stack/adapter/manager.ts:90:21)
+    at ZStackAdapter.start (/app/node_modules/.pnpm/zigbee-herdsman@10.6.1/node_modules/zigbee-herdsman/src/adapter/z-stack/adapter/zStackAdapter.ts:135:16)
+    at Controller.start (/app/node_modules/.pnpm/zigbee-herdsman@10.6.1/node_modules/zigbee-herdsman/src/controller/controller.ts:146:29)
+    at Zigbee.start (/app/lib/zigbee.ts:70:27)
+    at Controller.start (/app/lib/controller.ts:117:29)
+    at start (/app/index.js:156:5))
+    at ZnpAdapterManager.beginCommissioning (/app/node_modules/.pnpm/zigbee-herdsman@10.6.1/node_modules/zigbee-herdsman/src/adapter/z-stack/adapter/manager.ts:378:23)
+    at ZnpAdapterManager.start (/app/node_modules/.pnpm/zigbee-herdsman@10.6.1/node_modules/zigbee-herdsman/src/adapter/z-stack/adapter/manager.ts:90:21)
+    at ZStackAdapter.start (/app/node_modules/.pnpm/zigbee-herdsman@10.6.1/node_modules/zigbee-herdsman/src/adapter/z-stack/adapter/zStackAdapter.ts:135:16)
+    at Controller.start (/app/node_modules/.pnpm/zigbee-herdsman@10.6.1/node_modules/zigbee-herdsman/src/controller/controller.ts:146:29)
+    at Zigbee.start (/app/lib/zigbee.ts:70:27)
+    at Controller.start (/app/lib/controller.ts:117:29)
+    at start (/app/index.js:156:5)

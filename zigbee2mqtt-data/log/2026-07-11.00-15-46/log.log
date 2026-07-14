@@ -1,0 +1,14 @@
+[2026-07-11 00:15:46] info: 	z2m: Logging to console, file (filename: log.log)
+[2026-07-11 00:15:46] info: 	z2m: Starting Zigbee2MQTT version 2.12.1 (commit #aa909a8a62f76e2dd98ace3a172bca88ee56f5fe
+)
+[2026-07-11 00:15:46] info: 	z2m: Starting zigbee-herdsman (10.6.1)
+[2026-07-11 00:15:46] info: 	zh:zstack:znp: Opening TCP socket with 172.22.10.88:6638
+[2026-07-11 00:15:46] info: 	zh:zstack:znp: Socket connected
+[2026-07-11 00:15:46] info: 	zh:zstack:znp: Socket ready
+[2026-07-11 00:15:46] info: 	zh:zstack:znp: Writing CC2530/CC2531 skip bootloader payload
+[2026-07-11 00:15:47] info: 	zh:zstack:znp: Skip bootloader for CC2652/CC1352
+[2026-07-11 00:16:55] info: 	z2m: Stopping Zigbee2MQTT (restart=false, code=0, signal=SIGTERM)
+[2026-07-11 00:16:55] info: 	z2m: Disconnecting from MQTT server
+[2026-07-11 00:16:55] info: 	z2m: Stopping zigbee-herdsman...
+[2026-07-11 00:16:55] info: 	z2m: Stopped zigbee-herdsman
+[2026-07-11 00:16:55] info: 	z2m: Stopped Zigbee2MQTT
