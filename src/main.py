@@ -178,6 +178,58 @@ def show_review_count():
     storage = Storage()
     count = storage.count_pending_reviews()
     print(f"Pending reviews: {count}")
+def show_review_stats():
+    """CLI: Print review analytics summary.
+
+    STEP 4B.2: Thin presentation layer over Storage.get_review_analytics().
+    No SQL here - all aggregation logic lives in Storage, so any future
+    consumer (Web UI, REST API) can reuse the exact same data without
+    duplicating queries.
+    """
+    storage = Storage()
+    analytics = storage.get_review_analytics()
+    summary = analytics["summary"]
+
+    print("Review Analytics")
+    print()
+    print(f"Observations: {summary['total_observations']}")
+    print(f"Pending: {summary['pending']}")
+    print(f"Reviewed: {summary['reviewed']}")
+    print()
+    print(f"Approved: {summary['approved']}")
+    print(f"Rejected: {summary['rejected']}")
+    print(f"Corrected: {summary['corrected']}")
+
+    if summary["approval_rate"] is None:
+        print("Approval rate: N/A (no reviews yet)")
+    else:
+        print(f"Approval rate: {summary['approval_rate']:.1%}")
+
+    if analytics["by_classifier"]:
+        print()
+        print("By classifier:")
+        for c in analytics["by_classifier"]:
+            if c["approval_rate"] is None:
+                print(f"- {c['classifier_name']}: no reviews yet")
+            else:
+                print(
+                    f"- {c['classifier_name']}: "
+                    f"{c['approved']}/{c['reviewed']} approved "
+                    f"({c['approval_rate']:.1%})"
+                )
+
+    if analytics["most_corrected_categories"]:
+        print()
+        print("Most corrected categories:")
+        for entry in analytics["most_corrected_categories"]:
+            print(f"- {entry['hypothesis_category']}: {entry['correction_count']} correction(s)")
+
+    if analytics["problematic_devices"]:
+        print()
+        print("Problematic devices:")
+        for entry in analytics["problematic_devices"]:
+            name = entry["device_name"] or entry["device_id"]
+            print(f"- {name}: {entry['incorrect_count']} incorrect classification(s)")
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         command = sys.argv[1]
@@ -188,6 +240,8 @@ if __name__ == '__main__':
             show_legacy_review_queue()
         elif command == 'review-count':
             show_review_count()
+        elif command == 'review-stats':
+            show_review_stats()
         elif command == 'test':
             asyncio.run(test_mock_device())
     else:

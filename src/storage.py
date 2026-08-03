@@ -600,6 +600,211 @@ class Storage:
         finally:
             conn.close()
 
+    def get_review_analytics(self) -> Dict:
+        """Aggregate review decisions into a summary, per-classifier
+        breakdown, most-corrected categories, and problematic devices.
+
+        STEP 4B.1: Review Analytics data layer.
+
+        Uses its own short-lived connection (same reasoning as
+        count_pending_reviews() - see that method's docstring for why
+        self.connect()'s cached connection is not used here: this may
+        eventually be called from the same to_thread/CLI contexts).
+
+        Definitions:
+        - reviewed = human_decision is not NULL (approved, rejected,
+          or corrected). pending observations are excluded from all
+          rate calculations.
+        - approval_rate = approved / reviewed. None (not 0.0) when
+          reviewed == 0, so "no data yet" is never confused with
+          "0% approval".
+        - rejected and corrected both count as incorrect classifications
+          for the purpose of approval_rate; corrected additionally
+          contributes to most_corrected_categories.
+        - most_corrected_categories groups by hypothesis_category (the
+          classifier's original, wrong guess) where human_decision =
+          'corrected', not by corrected_category - this answers "which
+          category does the classifier most often get wrong", not
+          "which category do things get corrected to".
+        - problematic_devices groups by device_id (with device_name
+          for display) where human_decision is 'rejected' or
+          'corrected' - i.e. any incorrect classification, regardless
+          of which classifier or category was involved.
+        - Both breakdown lists are capped at the top 10 by count to
+          avoid returning an unbounded list on a large history.
+
+        Returns:
+            {
+                "summary": {
+                    "total_observations": int,
+                    "pending": int,
+                    "reviewed": int,
+                    "approved": int,
+                    "rejected": int,
+                    "corrected": int,
+                    "approval_rate": float | None,
+                },
+                "by_classifier": [
+                    {
+                        "classifier_name": str,
+                        "reviewed": int,
+                        "approved": int,
+                        "rejected": int,
+                        "corrected": int,
+                        "approval_rate": float | None,
+                    },
+                    ...
+                ],
+                "most_corrected_categories": [
+                    {"hypothesis_category": str, "correction_count": int},
+                    ...
+                ],
+                "problematic_devices": [
+                    {
+                        "device_id": str,
+                        "device_name": str,
+                        "incorrect_count": int,
+                    },
+                    ...
+                ],
+            }
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            summary = self._analytics_summary(conn)
+            by_classifier = self._analytics_by_classifier(conn)
+            most_corrected = self._analytics_most_corrected_categories(conn)
+            problematic = self._analytics_problematic_devices(conn)
+
+            return {
+                "summary": summary,
+                "by_classifier": by_classifier,
+                "most_corrected_categories": most_corrected,
+                "problematic_devices": problematic,
+            }
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _approval_rate(approved: int, reviewed: int) -> Optional[float]:
+        """Shared approval-rate calculation: None when reviewed == 0,
+        so callers never have to guess whether 0.0 means "0% approval"
+        or "no data yet"."""
+        if reviewed == 0:
+            return None
+        return approved / reviewed
+
+    def _analytics_summary(self, conn) -> Dict:
+        row = conn.execute('''
+            SELECT
+                COUNT(*) AS total_observations,
+                SUM(CASE WHEN review_status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN human_decision IS NOT NULL THEN 1 ELSE 0 END) AS reviewed,
+                SUM(CASE WHEN human_decision = 'approved' THEN 1 ELSE 0 END) AS approved,
+                SUM(CASE WHEN human_decision = 'rejected' THEN 1 ELSE 0 END) AS rejected,
+                SUM(CASE WHEN human_decision = 'corrected' THEN 1 ELSE 0 END) AS corrected
+            FROM classification_observations
+        ''').fetchone()
+
+        total_observations = row["total_observations"] or 0
+        pending = row["pending"] or 0
+        reviewed = row["reviewed"] or 0
+        approved = row["approved"] or 0
+        rejected = row["rejected"] or 0
+        corrected = row["corrected"] or 0
+
+        return {
+            "total_observations": total_observations,
+            "pending": pending,
+            "reviewed": reviewed,
+            "approved": approved,
+            "rejected": rejected,
+            "corrected": corrected,
+            "approval_rate": self._approval_rate(approved, reviewed),
+        }
+
+    def _analytics_by_classifier(self, conn) -> list:
+        rows = conn.execute('''
+            SELECT
+                classifier_name,
+                SUM(CASE WHEN human_decision IS NOT NULL THEN 1 ELSE 0 END) AS reviewed,
+                SUM(CASE WHEN human_decision = 'approved' THEN 1 ELSE 0 END) AS approved,
+                SUM(CASE WHEN human_decision = 'rejected' THEN 1 ELSE 0 END) AS rejected,
+                SUM(CASE WHEN human_decision = 'corrected' THEN 1 ELSE 0 END) AS corrected
+            FROM classification_observations
+            GROUP BY classifier_name
+            ORDER BY classifier_name
+        ''').fetchall()
+
+        result = []
+        for row in rows:
+            reviewed = row["reviewed"] or 0
+            approved = row["approved"] or 0
+            result.append({
+                "classifier_name": row["classifier_name"],
+                "reviewed": reviewed,
+                "approved": approved,
+                "rejected": row["rejected"] or 0,
+                "corrected": row["corrected"] or 0,
+                "approval_rate": self._approval_rate(approved, reviewed),
+            })
+        return result
+
+    def _analytics_most_corrected_categories(self, conn, limit: int = 10) -> list:
+        # ORDER BY includes a secondary ASC key on hypothesis_category
+        # so ties in correction_count produce a deterministic order -
+        # otherwise SQLite's tie-breaking is unspecified, which would
+        # make both tests and CLI output vary between runs.
+        rows = conn.execute('''
+            SELECT
+                hypothesis_category,
+                COUNT(*) AS correction_count
+            FROM classification_observations
+            WHERE human_decision = 'corrected'
+            GROUP BY hypothesis_category
+            ORDER BY correction_count DESC, hypothesis_category ASC
+            LIMIT ?
+        ''', (limit,)).fetchall()
+
+        return [
+            {
+                "hypothesis_category": row["hypothesis_category"],
+                "correction_count": row["correction_count"],
+            }
+            for row in rows
+        ]
+
+    def _analytics_problematic_devices(self, conn, limit: int = 10) -> list:
+        # TODO(STEP 4C+): incorrect_count alone can't distinguish "2
+        # wrong out of 2 attempts" from "2 wrong out of 150 attempts".
+        # Consider adding approved_count and a per-device approval_rate
+        # here, mirroring _analytics_by_classifier(), once there's a
+        # concrete use case (device-level trend dashboard, etc).
+        #
+        # Secondary ASC sort on device_name for the same determinism
+        # reason as _analytics_most_corrected_categories() above.
+        rows = conn.execute('''
+            SELECT
+                device_id,
+                device_name,
+                COUNT(*) AS incorrect_count
+            FROM classification_observations
+            WHERE human_decision IN ('rejected', 'corrected')
+            GROUP BY device_id
+            ORDER BY incorrect_count DESC, device_name ASC
+            LIMIT ?
+        ''', (limit,)).fetchall()
+
+        return [
+            {
+                "device_id": row["device_id"],
+                "device_name": row["device_name"],
+                "incorrect_count": row["incorrect_count"],
+            }
+            for row in rows
+        ]
+
     def approve_observation(
         self,
         observation_id: str,
