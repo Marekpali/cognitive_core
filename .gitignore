@@ -30,3 +30,8 @@ data/*.db-journal
 *.swo
 *.sqlite
 *.sqlite3
+
+# Staging/working files from manual sync sessions
+src/*_current.py
+src/*_step*.py
+diff_output.txt
