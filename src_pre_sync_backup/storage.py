@@ -1,4 +1,4 @@
-# src/storage.py
+﻿# src/storage.py
 
 import sqlite3
 from pathlib import Path
@@ -89,61 +89,8 @@ class Storage:
             'ON environmental_readings(asset_id, timestamp DESC)'
         )
 
-        # NEW: Classification observations table (STEP 1)
-        self.init_classification_observations_schema(cursor)
-
-        # Commit ALL changes in one transaction
         conn.commit()
         conn.close()
-
-    def init_classification_observations_schema(self, cursor):
-        """Create classification_observations table.
-        
-        STEP 1 MINIMAL SCHEMA:
-        - Basic observation logging (no deduplication yet)
-        - No is_duplicate, duplicate_of_id, or conflict detection
-        - Simple indices for device and group queries
-        
-        Called from init_schema() during system startup.
-        Uses cursor from init_schema() — commit happens in init_schema().
-        """
-        
-        print("[STORAGE] Initializing classification_observations schema...")
-        
-        # TABLE: classification_observations (MINIMAL)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS classification_observations (
-                id TEXT PRIMARY KEY,
-                observation_group_id TEXT NOT NULL,
-                device_id TEXT NOT NULL,
-                classifier_name TEXT NOT NULL,
-                hypothesis_category TEXT NOT NULL,
-                hypothesis_confidence REAL NOT NULL,
-                hypothesis_reasoning TEXT,
-                device_name TEXT,
-                device_model TEXT,
-                device_manufacturer TEXT,
-                device_source_adapter TEXT NOT NULL,
-                device_entity_count INTEGER,
-                created_at TEXT NOT NULL
-            )
-        ''')
-        
-        print("[STORAGE] Table classification_observations created/verified")
-        
-        # INDICES
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_obs_device_time 
-            ON classification_observations(device_id, created_at DESC)
-        ''')
-        
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_obs_group_id 
-            ON classification_observations(observation_group_id)
-        ''')
-        
-        print("[STORAGE] Indices created/verified (2 indices)")
-        print("[STORAGE] classification_observations schema initialization complete ✓")
 
     def connect(self):
         """Get database connection"""
@@ -289,89 +236,6 @@ class Storage:
         conn.commit()
         print(f"[STORAGE] Rejected review: {review_id}")
         return True
-
-    def log_classification_observation(self, payload: Dict) -> Optional[str]:
-        """Log a single classifier observation.
-        
-        STEP 2: Classification Observations Logging
-        
-        Args:
-            payload: {
-                "observation_group_id": str (correlation ID for one device pass),
-                "device_id": str,
-                "classifier_name": str,
-                "hypothesis_category": str,
-                "hypothesis_confidence": float (0.0–1.0, not 0–100),
-                "hypothesis_reasoning": str,
-                "device_name": str,
-                "device_model": str,
-                "device_manufacturer": str,
-                "device_source_adapter": str (e.g., "ha"),
-                "device_entity_count": int,
-            }
-        
-        Returns:
-            observation_id (str) or None if logging failed
-            
-        Notes:
-            - Uses own ID generation (obs_xxxxx), not lastrowid
-            - Follows same pattern as insert_environmental_reading()
-            - Errors are logged but don't stop asset creation
-            - Confidence is stored as-is (0.0–1.0), displayed as percentage
-        """
-        from uuid import uuid4
-        
-        conn = self.connect()
-        cursor = conn.cursor()
-        
-        observation_id = f"obs_{uuid4().hex[:12]}"
-        now = datetime.utcnow().isoformat() + 'Z'
-        
-        try:
-            cursor.execute('''
-                INSERT INTO classification_observations (
-                    id,
-                    observation_group_id,
-                    device_id,
-                    classifier_name,
-                    hypothesis_category,
-                    hypothesis_confidence,
-                    hypothesis_reasoning,
-                    device_name,
-                    device_model,
-                    device_manufacturer,
-                    device_source_adapter,
-                    device_entity_count,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                observation_id,
-                payload["observation_group_id"],
-                payload["device_id"],
-                payload["classifier_name"],
-                payload["hypothesis_category"],
-                payload["hypothesis_confidence"],
-                payload["hypothesis_reasoning"],
-                payload["device_name"],
-                payload["device_model"],
-                payload["device_manufacturer"],
-                payload["device_source_adapter"],
-                payload["device_entity_count"],
-                now
-            ))
-            
-            conn.commit()
-            print(
-                f"[STORAGE] Observation logged: {observation_id} "
-                f"({payload['classifier_name']} @ "
-                f"{payload['hypothesis_confidence'] * 100:.0f}%)"
-            )
-            return observation_id
-        
-        except Exception as exc:
-            conn.rollback()
-            print(f"[STORAGE] WARNING: observation logging failed: {exc}")
-            return None
 
     def insert_environmental_reading(self, asset_id: str, data: Dict) -> int:
         """Insert environmental sensor reading"""

@@ -1,77 +1,115 @@
-﻿# src/classifiers/environmental.py
-
 class EnvironmentalSensorClassifier:
-    """Environmental sensor classifier for multi-sensor devices (temp, humidity, illuminance, motion)"""
-    
-    async def classify(self, device: dict) -> dict:
-        """Classify environmental sensor"""
-        score = 0
-        reasoning = []
-        
-        # Manufacturer patterns
-        manufacturer = (device.get('manufacturer') or '').lower()
-        if 'tuya' in manufacturer or 'tze' in manufacturer:
-            score += 0.85
-            reasoning.append('Manufacturer: Tuya/TZE')
-        elif 'zigbee' in manufacturer.lower():
+    """Classify environmental and multi-sensor devices."""
+
+    CATEGORY = "environmental_sensor"
+    MIN_CONFIDENCE = 0.55
+
+    async def classify(self, device: dict) -> dict | None:
+        """Return an environmental-sensor classification or None."""
+        score = 0.0
+        reasoning: list[str] = []
+
+        manufacturer = str(device.get("manufacturer") or "").lower()
+        model = str(device.get("model") or "").lower()
+        name = str(device.get("name") or "").lower()
+
+        entities = device.get("entities") or []
+        if not isinstance(entities, list):
+            entities = []
+
+        searchable_entities: list[str] = []
+
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+
+            searchable_entities.append(
+                " ".join(
+                    str(entity.get(field) or "").lower()
+                    for field in (
+                        "name",
+                        "entity_id",
+                        "type",
+                        "domain",
+                        "device_class",
+                        "original_device_class",
+                    )
+                )
+            )
+
+        def entity_matches(*terms: str) -> bool:
+            return any(
+                any(term in entity_text for term in terms)
+                for entity_text in searchable_entities
+            )
+
+        has_temperature = entity_matches("temperature", "temp")
+        has_humidity = entity_matches("humidity")
+        has_illuminance = entity_matches("illuminance", "lux")
+        has_motion = entity_matches(
+            "motion",
+            "occupancy",
+            "presence",
+        )
+        has_battery = entity_matches("battery")
+
+        environmental_classes = [
+            label
+            for label, detected in (
+                ("temperature", has_temperature),
+                ("humidity", has_humidity),
+                ("illuminance", has_illuminance),
+                ("motion", has_motion),
+                ("battery", has_battery),
+            )
+            if detected
+        ]
+
+        primary_sensor_count = sum(
+            (
+                has_temperature,
+                has_humidity,
+                has_illuminance,
+                has_motion,
+            )
+        )
+
+        # Entity evidence should carry the greatest weight.
+        if primary_sensor_count >= 3:
             score += 0.70
-            reasoning.append('Manufacturer: Generic Zigbee')
-        
-        # Model/name patterns - TS0601 is Tuya multi-sensor
-        model = (device.get('model') or '').lower()
-        name = (device.get('name') or '').lower()
-        
-        if 'ts0601' in model or 'ts0601' in name:
-            score += 0.95
-            reasoning.append('Model: TS0601 (Tuya multi-sensor)')
-        
-        # Entities - look for environmental sensor markers
-        entities = device.get('entities', []) or []
-        entity_names = [(e.get('name') or '').lower() for e in entities]
-        entity_types = [(e.get('type') or '').lower() for e in entities]
-        
-        # Count environmental indicators
-        has_temperature = any('temperature' in name or 'temp' in name for name in entity_names)
-        has_humidity = any('humidity' in name for name in entity_names)
-        has_illuminance = any('illuminance' in name or 'lux' in name or 'light' in name for name in entity_names)
-        has_motion = any('motion' in name or 'occupancy' in name or 'presence' in name for name in entity_names)
-        has_battery = any('battery' in name for name in entity_names)
-        
-        sensor_count = sum([has_temperature, has_humidity, has_illuminance, has_motion, has_battery])
-        
-        if sensor_count >= 3:
-            score += 0.90
-            reasoning.append(f'Multi-sensor: {sensor_count} sensor types detected')
-        elif sensor_count == 2:
-            score += 0.70
-            reasoning.append(f'Multi-sensor: {sensor_count} sensor types detected')
-        elif sensor_count == 1:
-            score += 0.40
-            reasoning.append(f'Single sensor type detected')
-        
-        # Device class hints
-        device_classes = []
-        if has_temperature:
-            device_classes.append('temperature')
-        if has_humidity:
-            device_classes.append('humidity')
-        if has_illuminance:
-            device_classes.append('illuminance')
-        if has_motion:
-            device_classes.append('motion')
+            reasoning.append(
+                f"Detected {primary_sensor_count} environmental sensor types"
+            )
+        elif primary_sensor_count == 2:
+            score += 0.55
+            reasoning.append("Detected 2 environmental sensor types")
+        elif primary_sensor_count == 1:
+            score += 0.25
+            reasoning.append("Detected 1 environmental sensor type")
+
         if has_battery:
-            device_classes.append('battery')
-        
-        # Final score calculation
-        final_score = min(score / 3, 1.0)
-        
-        if final_score > 0.4:
-            return {
-                'category': 'environmental_sensor',
-                'confidence': final_score,
-                'reasoning': ' + '.join(reasoning),
-                'classifier': 'EnvironmentalSensorClassifier',
-                'device_classes': device_classes
-            }
-        
-        return None
+            score += 0.05
+            reasoning.append("Battery-powered device")
+
+        # Manufacturer is supporting evidence only.
+        if "tuya" in manufacturer or "_tze" in manufacturer:
+            score += 0.10
+            reasoning.append("Manufacturer indicates Tuya/TZE")
+
+        # TS0601 is too broad to be decisive by itself.
+        if "ts0601" in model or "ts0601" in name:
+            score += 0.10
+            reasoning.append("Model family TS0601")
+
+        confidence = min(score, 1.0)
+
+        if confidence < self.MIN_CONFIDENCE:
+            return None
+
+        return {
+            "category": self.CATEGORY,
+            "confidence": round(confidence, 3),
+            "reasoning": " + ".join(reasoning),
+            "classifier": self.__class__.__name__,
+            "device_classes": environmental_classes,
+        }
