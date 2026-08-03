@@ -568,18 +568,37 @@ class Storage:
         the only current consumer needs to answer "are there any
         observations to review right now?"
 
+        STEP 4A.2 thread-safety note: this method uses its own
+        short-lived connection instead of self.connect(). It is the
+        one Storage method invoked via asyncio.to_thread() (see
+        ha_sensor.update_pending_reviews(), called from core.py and
+        main.py). sqlite3 connections are thread-affine by default
+        (check_same_thread=True) and to_thread() runs on the executor's
+        thread pool - a different thread than whichever one first
+        created self.connection via self.connect(). Reusing the cached
+        connection across threads would raise:
+            sqlite3.ProgrammingError: SQLite objects created in a
+            thread can only be used in that same thread
+        A plain `with sqlite3.connect(...) as conn:` does NOT avoid a
+        connection leak here - Connection's context manager only
+        commits/rolls back the transaction on exit, it does not close
+        the connection. Given how often this method is called (every
+        device detection, every 60s reconcile tick, every CLI
+        decision), that would leak a file handle per call. Explicit
+        try/finally close() is used instead.
+
         Returns:
             Count of classification_observations with review_status='pending'
         """
-        conn = self.connect()
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            SELECT COUNT(*) FROM classification_observations
-            WHERE review_status = 'pending'
-        ''')
-
-        return cursor.fetchone()[0]
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.execute('''
+                SELECT COUNT(*) FROM classification_observations
+                WHERE review_status = 'pending'
+            ''')
+            return int(cursor.fetchone()[0])
+        finally:
+            conn.close()
 
     def approve_observation(
         self,

@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from src.core import CognitiveCore
 from src.storage import Storage
+from src.ha_sensor import update_pending_reviews
 async def main_loop(core: CognitiveCore):
     """Main event loop"""
     await core.start()
@@ -12,9 +13,35 @@ async def main_loop(core: CognitiveCore):
     for adapter in core.adapters.values():
         asyncio.create_task(adapter.listen(core.on_device_detected))
     
+    # STEP 4A.2: periodic reconcile of the pending-reviews sensor.
+    # Event-driven pushes (core.py's start()/on_device_detected(), and
+    # show_review_queue()'s approve/reject/correct handlers below) are
+    # the primary update mechanism and fire immediately. This loop is
+    # only a safety net - it catches drift from anything that bypasses
+    # those paths (a crashed push, a manual DB edit, etc).
+    RECONCILE_INTERVAL_SECONDS = 60
+    elapsed_since_reconcile = 0
+    # STEP 4A.2: holds references to fire-and-forget reconcile tasks
+    # so they aren't garbage-collected mid-execution (see core.py's
+    # _fire_and_forget for the same pattern and rationale).
+    background_tasks: set = set()
+
     # Keep running
     while True:
         await asyncio.sleep(1)
+        elapsed_since_reconcile += 1
+        if elapsed_since_reconcile >= RECONCILE_INTERVAL_SECONDS:
+            # asyncio.to_thread: update_pending_reviews() is a blocking
+            # call (sqlite3 + requests.post). Running it directly here
+            # would freeze the entire event loop - including the HA
+            # adapter's listen() task - for the duration of the HTTP
+            # call. A stalled Supervisor could block device detection
+            # for up to REQUEST_TIMEOUT_SECONDS. Offloading to a thread
+            # keeps the loop responsive regardless.
+            task = asyncio.create_task(asyncio.to_thread(update_pending_reviews, core.storage))
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
+            elapsed_since_reconcile = 0
 async def test_mock_device():
     """Test with mock device"""
     core = CognitiveCore()
@@ -91,9 +118,11 @@ def show_review_queue():
         if choice == 'a':
             storage.approve_observation(obs['id'])
             print("    ✓ Approved")
+            update_pending_reviews(storage)
         elif choice == 'r':
             storage.reject_observation(obs['id'])
             print("    ✗ Rejected")
+            update_pending_reviews(storage)
         elif choice == 'c':
             print(f"    Known categories: {', '.join(sorted(KNOWN_CATEGORIES))}")
             corrected_category = input("    Correct category > ").strip()
@@ -104,6 +133,7 @@ def show_review_queue():
                 print(f"    ! Must be one of: {', '.join(sorted(KNOWN_CATEGORIES))}")
             else:
                 storage.correct_observation(obs['id'], corrected_category)
+                update_pending_reviews(storage)
                 print(f"    ~ Corrected to '{corrected_category}'")
         elif choice == 's':
             print("    ~ Skipped")
