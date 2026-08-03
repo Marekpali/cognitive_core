@@ -1,6 +1,7 @@
 # src/storage.py
 
 import sqlite3
+import os
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, List
@@ -9,9 +10,37 @@ import json
 class Storage:
     """SQLite-based operational data storage"""
 
-    def __init__(self, db_path: Path = Path("data/core.db")):
-        self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db_path: Optional[Path] = None):
+        """Initialize storage, resolving the database path.
+
+        STEP 4A.1b: db_path resolution order:
+        1. Explicit db_path argument (used by CognitiveCore, which
+           passes it from DB_PATH env or a default, and by tests,
+           which pass a temp path)
+        2. DB_PATH environment variable (used when Storage() is
+           constructed with no argument, e.g. from a `docker exec`
+           CLI invocation - this does NOT inherit variables exported
+           by run.sh in the main process, only what the container
+           environment itself defines)
+        3. Hardcoded '/data/core.db' fallback - the add-on's
+           persistent storage path, so a bare `Storage()` call always
+           resolves to the same production database regardless of
+           the caller's working directory.
+
+        Before this fix, the default was a relative Path("data/core.db"),
+        which silently resolved differently depending on cwd - matching
+        the running add-on process (cwd=/app) by coincidence, but
+        creating a separate, ephemeral database under `docker exec`
+        (also cwd=/app, but /app/data/core.db is not the same file as
+        the mounted /data/core.db).
+        """
+        self.db_path = (
+            Path(db_path)
+            if db_path is not None
+            else Path(os.getenv("DB_PATH", "/data/core.db"))
+        )
+        if not self.db_path.parent.exists():
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = None
         self.init_schema()
 
@@ -529,6 +558,28 @@ class Storage:
             )
 
         return [dict(row) for row in cursor.fetchall()]
+
+    def count_pending_reviews(self) -> int:
+        """Count observations awaiting human review.
+
+        STEP 4A.1: Foundation for review workflow notifications
+        (pending-count CLI, Home Assistant sensor, notifications).
+        Deliberately minimal - a single number, no breakdown - since
+        the only current consumer needs to answer "are there any
+        observations to review right now?"
+
+        Returns:
+            Count of classification_observations with review_status='pending'
+        """
+        conn = self.connect()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT COUNT(*) FROM classification_observations
+            WHERE review_status = 'pending'
+        ''')
+
+        return cursor.fetchone()[0]
 
     def approve_observation(
         self,

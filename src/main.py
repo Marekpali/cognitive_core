@@ -140,6 +140,14 @@ def show_legacy_review_queue():
             print("    ✗ Rejected")
         elif choice == 's':
             print("    ~ Skipped")
+def show_review_count():
+    """CLI: Print the number of observations awaiting review.
+
+    STEP 4A.1: Foundation for review workflow notifications.
+    """
+    storage = Storage()
+    count = storage.count_pending_reviews()
+    print(f"Pending reviews: {count}")
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         command = sys.argv[1]
@@ -148,6 +156,8 @@ if __name__ == '__main__':
             show_review_queue()
         elif command == 'legacy-review':
             show_legacy_review_queue()
+        elif command == 'review-count':
+            show_review_count()
         elif command == 'test':
             asyncio.run(test_mock_device())
     else:
