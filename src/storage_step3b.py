@@ -155,23 +155,11 @@ class Storage:
         Safe to call on every startup - running twice does nothing on
         the second run.
 
-        Wrapped in try/except with rollback: if the process is killed
-        or crashes mid-migration, the failed attempt does not leave a
-        committed partial state. Because this method is idempotent,
-        a retry on the next startup picks up cleanly regardless.
-
         Columns added to classification_observations:
         - review_status: 'pending' | 'reviewed' (default 'pending')
         - human_decision: 'approved' | 'rejected' | 'corrected' | NULL
         - reviewed_at: ISO timestamp when reviewed, NULL if pending
         - review_reason: Optional text notes from reviewer
-        - corrected_category: STEP 3C - the human-supplied correct
-          category when human_decision='corrected'. Kept separate from
-          hypothesis_category so the classifier's original (wrong)
-          guess is preserved for accuracy tracking.
-        - reviewed_by: STEP 3C - who made the decision. Defaults to
-          'human' today; leaves room for named reviewers or automated
-          review agents later without a schema change.
         """
         print("[STORAGE] Checking for review columns...")
 
@@ -189,49 +177,29 @@ class Storage:
             "human_decision": "TEXT",
             "reviewed_at": "TEXT",
             "review_reason": "TEXT",
-            "corrected_category": "TEXT",
-            "reviewed_by": "TEXT",
         }
 
-        to_add = {
-            name: definition
-            for name, definition in columns.items()
-            if name not in existing
-        }
-
-        if not to_add:
-            print("[STORAGE] All review columns already present")
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS
-                idx_classification_observations_review_status
-                ON classification_observations(review_status)
-            """)
-            conn.commit()
-            print("[STORAGE] Index verified: idx_classification_observations_review_status")
-            return
-
-        try:
-            for name, definition in to_add.items():
+        added = []
+        for name, definition in columns.items():
+            if name not in existing:
                 cursor.execute(
                     f"ALTER TABLE classification_observations "
                     f"ADD COLUMN {name} {definition}"
                 )
+                added.append(name)
                 print(f"[STORAGE] Added column: {name}")
 
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS
-                idx_classification_observations_review_status
-                ON classification_observations(review_status)
-            """)
+        if added:
+            print(f"[STORAGE] Migrated {len(added)} column(s)")
+        else:
+            print("[STORAGE] All review columns already present")
 
-            conn.commit()
-            print(f"[STORAGE] Migrated {len(to_add)} column(s)")
-            print("[STORAGE] Index verified: idx_classification_observations_review_status")
-
-        except Exception as exc:
-            conn.rollback()
-            print(f"[STORAGE] ERROR: migration failed, rolled back: {exc}")
-            raise
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_classification_observations_review_status
+            ON classification_observations(review_status)
+        """)
+        print("[STORAGE] Index verified: idx_classification_observations_review_status")
 
     def connect(self):
         """Get database connection"""
@@ -489,8 +457,7 @@ class Storage:
             id, observation_group_id, device_id, device_name,
             classifier_name, hypothesis_category, hypothesis_confidence,
             hypothesis_reasoning, review_status, human_decision,
-            reviewed_at, review_reason, corrected_category, reviewed_by,
-            created_at
+            reviewed_at, review_reason, created_at
         """
         conn = self.connect()
         cursor = conn.cursor()
@@ -509,8 +476,6 @@ class Storage:
                 human_decision,
                 reviewed_at,
                 review_reason,
-                corrected_category,
-                reviewed_by,
                 created_at
             FROM classification_observations
         '''
@@ -529,149 +494,6 @@ class Storage:
             )
 
         return [dict(row) for row in cursor.fetchall()]
-
-    def approve_observation(
-        self,
-        observation_id: str,
-        reason: Optional[str] = None,
-        reviewed_by: str = "human",
-    ) -> bool:
-        """Mark an observation as approved (classifier was correct).
-
-        STEP 3C: Human decision - approve.
-
-        Args:
-            observation_id: the classification_observations.id to update
-            reason: optional free-text note from the reviewer
-            reviewed_by: who made the decision (default 'human')
-
-        Returns:
-            True if a row was updated, False if the observation_id
-            was not found (in which case nothing is committed).
-        """
-        conn = self.connect()
-        cursor = conn.cursor()
-
-        now = datetime.utcnow().isoformat() + 'Z'
-
-        cursor.execute('''
-            UPDATE classification_observations
-            SET
-                review_status = 'reviewed',
-                human_decision = 'approved',
-                reviewed_at = ?,
-                review_reason = ?,
-                reviewed_by = ?
-            WHERE id = ?
-        ''', (now, reason, reviewed_by, observation_id))
-
-        if cursor.rowcount == 0:
-            conn.rollback()
-            print(f"[STORAGE] WARNING: approve_observation found no row for {observation_id}")
-            return False
-
-        conn.commit()
-        print(f"[STORAGE] Observation approved: {observation_id}")
-        return True
-
-    def reject_observation(
-        self,
-        observation_id: str,
-        reason: Optional[str] = None,
-        reviewed_by: str = "human",
-    ) -> bool:
-        """Mark an observation as rejected (classifier was wrong,
-        no correct category supplied).
-
-        STEP 3C: Human decision - reject.
-
-        Args:
-            observation_id: the classification_observations.id to update
-            reason: optional free-text note from the reviewer
-            reviewed_by: who made the decision (default 'human')
-
-        Returns:
-            True if a row was updated, False if the observation_id
-            was not found (in which case nothing is committed).
-        """
-        conn = self.connect()
-        cursor = conn.cursor()
-
-        now = datetime.utcnow().isoformat() + 'Z'
-
-        cursor.execute('''
-            UPDATE classification_observations
-            SET
-                review_status = 'reviewed',
-                human_decision = 'rejected',
-                reviewed_at = ?,
-                review_reason = ?,
-                reviewed_by = ?
-            WHERE id = ?
-        ''', (now, reason, reviewed_by, observation_id))
-
-        if cursor.rowcount == 0:
-            conn.rollback()
-            print(f"[STORAGE] WARNING: reject_observation found no row for {observation_id}")
-            return False
-
-        conn.commit()
-        print(f"[STORAGE] Observation rejected: {observation_id}")
-        return True
-
-    def correct_observation(
-        self,
-        observation_id: str,
-        corrected_category: str,
-        reason: Optional[str] = None,
-        reviewed_by: str = "human",
-    ) -> bool:
-        """Mark an observation as corrected: classifier was wrong,
-        and the human supplies the correct category.
-
-        STEP 3C: Human decision - correct.
-
-        The original hypothesis_category is preserved as-is (it stays
-        the classifier's actual guess). corrected_category stores the
-        human-supplied correct answer separately, so future accuracy
-        tracking can compare "what the classifier said" against "what
-        was actually true" without losing either value.
-
-        Args:
-            observation_id: the classification_observations.id to update
-            corrected_category: the human-supplied correct category
-            reason: optional free-text note from the reviewer
-            reviewed_by: who made the decision (default 'human')
-
-        Returns:
-            True if a row was updated, False if the observation_id
-            was not found (in which case nothing is committed).
-        """
-        conn = self.connect()
-        cursor = conn.cursor()
-
-        now = datetime.utcnow().isoformat() + 'Z'
-
-        cursor.execute('''
-            UPDATE classification_observations
-            SET
-                review_status = 'reviewed',
-                human_decision = 'corrected',
-                corrected_category = ?,
-                reviewed_at = ?,
-                review_reason = ?,
-                reviewed_by = ?
-            WHERE id = ?
-        ''', (corrected_category, now, reason, reviewed_by, observation_id))
-
-        if cursor.rowcount == 0:
-            conn.rollback()
-            print(f"[STORAGE] WARNING: correct_observation found no row for {observation_id}")
-            return False
-
-        conn.commit()
-        print(f"[STORAGE] Observation corrected: {observation_id} -> {corrected_category}")
-        return True
 
     def insert_environmental_reading(self, asset_id: str, data: Dict) -> int:
         """Insert environmental sensor reading"""
