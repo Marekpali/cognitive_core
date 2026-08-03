@@ -102,6 +102,14 @@ def test_cross_thread_count():
             print("   ✗ Main thread connection was unexpectedly replaced")
             return False
 
+        # Windows-specific: TemporaryDirectory's cleanup on __exit__ will
+        # fail with PermissionError if the cached storage.connection is
+        # still open, because Windows (unlike Unix) refuses to remove a
+        # file that's still held open by a live handle. Close explicitly
+        # before the `with` block below ends.
+        if storage.connection:
+            storage.connection.close()
+
     print()
     return True
 
@@ -131,6 +139,11 @@ async def test_via_actual_asyncio_to_thread():
         else:
             print(f"   ✗ FAILED: expected count=1, got {count}")
             return False
+
+        # Windows-specific cleanup requirement - see comment in
+        # test_cross_thread_count() above.
+        if storage.connection:
+            storage.connection.close()
 
     print()
     return True

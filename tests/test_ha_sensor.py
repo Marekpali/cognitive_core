@@ -139,6 +139,15 @@ def test_update_pending_reviews_integration():
                     return False
 
                 print(f"   ✓ Counted 2 pending, published state='2' via mocked HTTP")
+
+        # Windows-specific: TemporaryDirectory's cleanup on __exit__ fails
+        # with PermissionError if the cached storage.connection (opened
+        # by insert_test_observation's storage.connect() calls above) is
+        # still open - Windows refuses to remove a file held open by a
+        # live handle, unlike Unix. Close explicitly before the `with`
+        # block ends.
+        if storage.connection:
+            storage.connection.close()
     print()
     return True
 
