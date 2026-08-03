@@ -35,3 +35,6 @@ data/*.db-journal
 src/*_current.py
 src/*_step*.py
 diff_output.txt
+
+# Root-level staging files
+/*_step*.py
