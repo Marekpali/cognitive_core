@@ -1013,6 +1013,130 @@ class Storage:
         finally:
             conn.close()
 
+    def get_correction_patterns(self) -> List[Dict]:
+        """Aggregate human-corrected classifications into (classifier,
+        predicted category, corrected category) patterns with sample size.
+
+        STEP 6 (first increment, "Level 1" per docs/STEP5_ARCHITECTURE.md -
+        renamed STEP 6 in this repo's history since the review_cases
+        idempotency work absorbed the "STEP 5" name; the design intent is
+        unchanged): turns accumulated human decisions into statistics a
+        human can act on. Does NOT modify classifiers, confidence, or
+        rules - this method is read-only and purely observational.
+
+        CRITICAL - unit of analysis (established during the STEP 6 audit,
+        with direct production evidence from a "T & H Sensor" device):
+
+        review_cases.last_observation_id is a freshness pointer, NOT a
+        decision pointer. It advances after a case is resolved whenever a
+        later, unlabelled observation for the same logical key arrives.
+        This method therefore NEVER joins through review_cases or
+        last_observation_id. The only correct source for "what did a
+        human actually decide" is classification_observations rows where
+        human_decision IS NOT NULL, taken directly.
+
+        Raw observation count is NOT sample size. A single device can
+        produce many repeated classification_observations rows for one
+        still-or-already-reviewed logical hypothesis (confirmed in
+        production: 10 raw observations backing only 1 actual human
+        judgment). sample_size here counts independent labelled logical
+        cases only - never raw rows.
+
+        Integrity precondition: the current architecture (resolve_review_
+        case()'s dual-write, scoped to exactly one observation row per
+        logical key at decision time) should make it impossible for more
+        than one classification_observations row per (device_id,
+        classifier_name, hypothesis_category) to carry a non-NULL
+        human_decision at the same time. This method verifies that
+        precondition before computing anything. If violated, it raises
+        rather than guessing which row represents the real judgment
+        (picking "newest" would be arbitrary; silently counting both or
+        skipping would corrupt or hide the statistic) - this can currently
+        only happen via the legacy approve_observation()/
+        reject_observation()/correct_observation() methods, which bypass
+        review_cases entirely and are not exercised by any current call
+        site, but remain reachable.
+
+        Returns:
+            List of dicts, most-corrected first:
+            [{
+                "classifier_name": str,
+                "hypothesis_category": str,
+                "corrected_category": str,
+                "correction_count": int,
+                "sample_size": int,  # all labelled judgments (approved +
+                                     # rejected + corrected) for this
+                                     # (classifier_name, hypothesis_category)
+                                     # across all devices - the denominator
+                                     # for correction_count, not the same
+                                     # thing as correction_count's own count
+            }, ...]
+
+        Raises:
+            RuntimeError: if more than one classification_observations
+                row shares the same (device_id, classifier_name,
+                hypothesis_category) with human_decision IS NOT NULL.
+                No data is modified either way.
+        """
+        conn = self.connect()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT device_id, classifier_name, hypothesis_category, COUNT(*) AS cnt
+            FROM classification_observations
+            WHERE human_decision IS NOT NULL
+            GROUP BY device_id, classifier_name, hypothesis_category
+            HAVING COUNT(*) > 1
+        ''')
+        violations = cursor.fetchall()
+        if violations:
+            details = [
+                f"({v['device_id']}, {v['classifier_name']}, "
+                f"{v['hypothesis_category']}): {v['cnt']} labelled rows"
+                for v in violations
+            ]
+            raise RuntimeError(
+                "get_correction_patterns(): integrity assumption violated - "
+                f"{len(violations)} logical case(s) have more than one "
+                "labelled observation, which should be impossible under "
+                "the current resolve_review_case() dual-write discipline. "
+                f"Details: {details}"
+            )
+
+        cursor.execute('''
+            SELECT classifier_name, hypothesis_category, COUNT(*) AS sample_size
+            FROM classification_observations
+            WHERE human_decision IS NOT NULL
+            GROUP BY classifier_name, hypothesis_category
+        ''')
+        sample_sizes = {
+            (row['classifier_name'], row['hypothesis_category']): row['sample_size']
+            for row in cursor.fetchall()
+        }
+
+        cursor.execute('''
+            SELECT classifier_name, hypothesis_category, corrected_category,
+                   COUNT(*) AS correction_count
+            FROM classification_observations
+            WHERE human_decision = 'corrected'
+            GROUP BY classifier_name, hypothesis_category, corrected_category
+            ORDER BY correction_count DESC, classifier_name ASC,
+                     hypothesis_category ASC, corrected_category ASC
+        ''')
+
+        return [
+            {
+                "classifier_name": row["classifier_name"],
+                "hypothesis_category": row["hypothesis_category"],
+                "corrected_category": row["corrected_category"],
+                "correction_count": row["correction_count"],
+                "sample_size": sample_sizes[
+                    (row["classifier_name"], row["hypothesis_category"])
+                ],
+            }
+            for row in cursor.fetchall()
+        ]
+
     def get_review_analytics(self) -> Dict:
         """Aggregate review decisions into a summary, per-classifier
         breakdown, most-corrected categories, and problematic devices.

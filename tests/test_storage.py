@@ -199,6 +199,174 @@ def test_older_observation_cannot_replace_newer_case_evidence(temp_storage):
     assert cursor.fetchone()['last_observation_id'] == o2
 
 
+def _label(temp_storage, obs_id, decision, corrected_category=None):
+    """Directly mark an observation as human-labelled, bypassing
+    resolve_review_case(). Used only to set up test fixtures for
+    get_correction_patterns() - this is NOT the production write path
+    (that's resolve_review_case()'s dual-write), but the read side under
+    test only cares about the resulting classification_observations
+    columns, not how they got there."""
+    conn = temp_storage.connect()
+    conn.execute(
+        "UPDATE classification_observations "
+        "SET review_status='reviewed', human_decision=?, corrected_category=?, "
+        "reviewed_at=? WHERE id=?",
+        (decision, corrected_category, datetime.utcnow().isoformat() + 'Z', obs_id),
+    )
+    conn.commit()
+
+
+def test_get_correction_patterns_empty_db(temp_storage):
+    assert temp_storage.get_correction_patterns() == []
+
+
+def test_get_correction_patterns_single_correction(temp_storage):
+    obs = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    _label(temp_storage, obs, "corrected", corrected_category="temperature_sensor")
+
+    patterns = temp_storage.get_correction_patterns()
+    assert len(patterns) == 1
+    assert patterns[0]["classifier_name"] == "env"
+    assert patterns[0]["hypothesis_category"] == "environmental"
+    assert patterns[0]["corrected_category"] == "temperature_sensor"
+    assert patterns[0]["correction_count"] == 1
+    assert patterns[0]["sample_size"] == 1
+
+
+def test_get_correction_patterns_aggregates_identical_triple(temp_storage):
+    obs1 = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    _label(temp_storage, obs1, "corrected", corrected_category="temperature_sensor")
+    obs2 = _obs(temp_storage, "g2", "dev2", "env", "environmental")
+    _label(temp_storage, obs2, "corrected", corrected_category="temperature_sensor")
+
+    patterns = temp_storage.get_correction_patterns()
+    assert len(patterns) == 1
+    assert patterns[0]["correction_count"] == 2
+    assert patterns[0]["sample_size"] == 2
+
+
+def test_get_correction_patterns_different_target_category_separate_row(temp_storage):
+    obs1 = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    _label(temp_storage, obs1, "corrected", corrected_category="temperature_sensor")
+    obs2 = _obs(temp_storage, "g2", "dev2", "env", "environmental")
+    _label(temp_storage, obs2, "corrected", corrected_category="humidity_sensor")
+
+    patterns = temp_storage.get_correction_patterns()
+    corrected_to = {p["corrected_category"] for p in patterns}
+    assert corrected_to == {"temperature_sensor", "humidity_sensor"}
+    assert len(patterns) == 2
+    for p in patterns:
+        assert p["correction_count"] == 1
+        assert p["sample_size"] == 2  # denominator is per (classifier, hypothesis), shared
+
+
+def test_get_correction_patterns_excludes_approved_and_rejected(temp_storage):
+    obs1 = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    _label(temp_storage, obs1, "approved")
+    obs2 = _obs(temp_storage, "g2", "dev2", "env", "environmental")
+    _label(temp_storage, obs2, "rejected")
+
+    patterns = temp_storage.get_correction_patterns()
+    assert patterns == []  # no corrections, but sample_size logic is exercised elsewhere
+
+
+def test_get_correction_patterns_ignores_review_cases_last_observation_id(temp_storage):
+    """Regression guard for the exact bug the STEP 6 audit caught in
+    production ('T & H Sensor'): review_cases.last_observation_id can
+    point at a DIFFERENT, unlabelled observation than the one carrying
+    the actual human_decision, once a later identical hypothesis arrives
+    after resolution. get_correction_patterns() must find the correction
+    via classification_observations directly, never via review_cases."""
+    obs1 = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    _label(temp_storage, obs1, "corrected", corrected_category="temperature_sensor")
+    case_id = temp_storage.upsert_review_case("dev1", "env", "environmental", obs1)
+    temp_storage.resolve_review_case(
+        case_id, expected_observation_id=obs1, decision="corrected",
+        corrected_category="temperature_sensor",
+    )
+
+    # A later, unlabelled observation for the same logical key arrives -
+    # review_cases.last_observation_id now points away from obs1.
+    obs2 = _obs(temp_storage, "g2", "dev1", "env", "environmental")
+    temp_storage.upsert_review_case("dev1", "env", "environmental", obs2)
+
+    conn = temp_storage.connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT last_observation_id FROM review_cases WHERE id=?", (case_id,)
+    )
+    assert cursor.fetchone()["last_observation_id"] == obs2  # precondition of the test
+
+    patterns = temp_storage.get_correction_patterns()
+    assert len(patterns) == 1
+    assert patterns[0]["correction_count"] == 1
+    assert patterns[0]["corrected_category"] == "temperature_sensor"
+
+
+def test_get_correction_patterns_multiple_classifiers_stay_separate(temp_storage):
+    obs1 = _obs(temp_storage, "g1", "dev1", "motion_sensor", "motion")
+    _label(temp_storage, obs1, "corrected", corrected_category="occupancy")
+    obs2 = _obs(temp_storage, "g2", "dev2", "environmental_sensor", "motion")
+    _label(temp_storage, obs2, "corrected", corrected_category="occupancy")
+
+    patterns = temp_storage.get_correction_patterns()
+    assert len(patterns) == 2
+    classifiers = {p["classifier_name"] for p in patterns}
+    assert classifiers == {"motion_sensor", "environmental_sensor"}
+    for p in patterns:
+        assert p["sample_size"] == 1  # each classifier has its own denominator
+
+
+def test_get_correction_patterns_is_read_only(temp_storage):
+    obs = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    _label(temp_storage, obs, "corrected", corrected_category="temperature_sensor")
+
+    conn = temp_storage.connect()
+    before_obs = conn.execute(
+        "SELECT COUNT(*) FROM classification_observations"
+    ).fetchone()[0]
+    before_cases = conn.execute("SELECT COUNT(*) FROM review_cases").fetchone()[0]
+
+    temp_storage.get_correction_patterns()
+
+    after_obs = conn.execute(
+        "SELECT COUNT(*) FROM classification_observations"
+    ).fetchone()[0]
+    after_cases = conn.execute("SELECT COUNT(*) FROM review_cases").fetchone()[0]
+    assert before_obs == after_obs
+    assert before_cases == after_cases
+
+
+def test_get_correction_patterns_deterministic_ordering(temp_storage):
+    obs_a = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    _label(temp_storage, obs_a, "corrected", corrected_category="a_category")
+    obs_b = _obs(temp_storage, "g2", "dev2", "env", "environmental")
+    _label(temp_storage, obs_b, "corrected", corrected_category="a_category")
+    obs_c = _obs(temp_storage, "g3", "dev3", "env", "environmental")
+    _label(temp_storage, obs_c, "corrected", corrected_category="b_category")
+
+    # Run twice - ordering must be stable, not incidental to SQLite's
+    # unspecified default tie-breaking.
+    first = temp_storage.get_correction_patterns()
+    second = temp_storage.get_correction_patterns()
+    assert first == second
+    assert first[0]["correction_count"] == 2  # a_category has 2, sorted first
+    assert first[0]["corrected_category"] == "a_category"
+
+
+def test_get_correction_patterns_raises_on_integrity_violation(temp_storage):
+    """Two labelled rows for the same logical key (device_id,
+    classifier_name, hypothesis_category) must hard-fail, not be
+    silently summed, skipped, or resolved by picking the newest."""
+    obs1 = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    _label(temp_storage, obs1, "corrected", corrected_category="temperature_sensor")
+    obs2 = _obs(temp_storage, "g2", "dev1", "env", "environmental")  # SAME device_id/classifier/category
+    _label(temp_storage, obs2, "approved")
+
+    with pytest.raises(RuntimeError, match="integrity assumption violated"):
+        temp_storage.get_correction_patterns()
+
+
 def test_backfill_reconstructs_state_without_reopening(temp_storage):
     a1 = _obs(temp_storage, "g1", "devX", "env", "categoryA", name="DX")
     conn = temp_storage.connect()
