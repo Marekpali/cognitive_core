@@ -6,6 +6,13 @@ STEP 4A.2 Test: ha_sensor module
 - publish_pending_reviews fails gracefully (returns False) on network error
 - update_pending_reviews counts via a real Storage + publishes via mocked HTTP
 - Nothing here makes a real network call
+
+STEP 5 update: count_pending_reviews() now counts review_cases.status=
+'pending', not raw classification_observations rows. insert_test_observation()
+now also drives the real review_cases path (upsert_review_case() +, for
+review_status="reviewed", resolve_review_case()) so this test exercises
+production behavior rather than a stale table that count_pending_reviews()
+no longer reads.
 """
 
 import os
@@ -35,6 +42,23 @@ def insert_test_observation(storage, obs_id, review_status="pending"):
     )
     conn.commit()
 
+    # STEP 5: drive the real review_cases path so count_pending_reviews()
+    # (now counting review_cases, not raw observation rows) reflects this
+    # observation correctly. Each obs_id gets its own device_id, so
+    # obs_1/obs_2 remain two independent pending cases; obs_3 is walked
+    # through the real resolve path so it stops counting as pending -
+    # matching the original test's intent of "3 inserted, 2 pending".
+    case_id = storage.upsert_review_case(
+        device_id=f"device_{obs_id}",
+        classifier_name="motion_sensor",
+        hypothesis_category="motion_sensor",
+        observation_id=obs_id,
+    )
+    if review_status == "reviewed":
+        storage.resolve_review_case(
+            case_id, expected_observation_id=obs_id, decision="approved"
+        )
+
 
 def test_publish_success():
     print("1. Testing publish_pending_reviews() success path...")
@@ -47,7 +71,7 @@ def test_publish_success():
             result = ha_sensor.publish_pending_reviews(3)
 
             if result is not True:
-                print(f"   ✗ Expected True, got {result}")
+                print(f"   âś— Expected True, got {result}")
                 return False
 
             call_args = mock_post.call_args
@@ -66,9 +90,9 @@ def test_publish_success():
             ]
             for ok, msg in checks:
                 if not ok:
-                    print(f"   ✗ {msg}")
+                    print(f"   âś— {msg}")
                     return False
-            print(f"   ✓ POST called correctly, no real network hit")
+            print(f"   âś“ POST called correctly, no real network hit")
     print()
     return True
 
@@ -81,12 +105,12 @@ def test_publish_no_token():
             result = ha_sensor.publish_pending_reviews(5)
 
             if result is not False:
-                print(f"   ✗ Expected False, got {result}")
+                print(f"   âś— Expected False, got {result}")
                 return False
             if mock_post.called:
-                print(f"   ✗ requests.post should NOT have been called")
+                print(f"   âś— requests.post should NOT have been called")
                 return False
-            print("   ✓ Returns False, no HTTP call attempted")
+            print("   âś“ Returns False, no HTTP call attempted")
     print()
     return True
 
@@ -100,13 +124,13 @@ def test_publish_network_error():
             try:
                 result = ha_sensor.publish_pending_reviews(2)
             except Exception as exc:
-                print(f"   ✗ Exception propagated (should have been caught): {exc}")
+                print(f"   âś— Exception propagated (should have been caught): {exc}")
                 return False
 
             if result is not False:
-                print(f"   ✗ Expected False, got {result}")
+                print(f"   âś— Expected False, got {result}")
                 return False
-            print("   ✓ Returns False, exception caught and not propagated")
+            print("   âś“ Returns False, exception caught and not propagated")
     print()
     return True
 
@@ -130,15 +154,15 @@ def test_update_pending_reviews_integration():
                 result = ha_sensor.update_pending_reviews(storage)
 
                 if result != 2:
-                    print(f"   ✗ Expected count 2, got {result}")
+                    print(f"   âś— Expected count 2, got {result}")
                     return False
 
                 payload = mock_post.call_args[1]["json"]
                 if payload["state"] != "2":
-                    print(f"   ✗ Published state should be '2', got {payload['state']}")
+                    print(f"   âś— Published state should be '2', got {payload['state']}")
                     return False
 
-                print(f"   ✓ Counted 2 pending, published state='2' via mocked HTTP")
+                print(f"   âś“ Counted 2 pending, published state='2' via mocked HTTP")
 
         # Windows-specific: TemporaryDirectory's cleanup on __exit__ fails
         # with PermissionError if the cached storage.connection (opened
@@ -167,12 +191,12 @@ def main():
 
     if all(results):
         print("=" * 60)
-        print("✓ ALL TESTS PASSED")
+        print("âś“ ALL TESTS PASSED")
         print("=" * 60)
         return True
     else:
         print("=" * 60)
-        print(f"✗ {results.count(False)} TEST(S) FAILED")
+        print(f"âś— {results.count(False)} TEST(S) FAILED")
         print("=" * 60)
         return False
 

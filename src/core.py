@@ -124,7 +124,7 @@ class CognitiveCore:
             print(f"[CORE] Result from {classifier_name}: {result}")
 
             if result:
-                self.storage.log_classification_observation({
+                observation_id = self.storage.log_classification_observation({
                     "observation_group_id": observation_group_id,
                     "device_id": device.get("id") or "unknown",
                     "classifier_name": classifier_name,
@@ -137,6 +137,21 @@ class CognitiveCore:
                     "device_source_adapter": source,
                     "device_entity_count": len(device.get("entities") or []),
                 })
+
+                # STEP 5: only create/refresh the logical review case
+                # when the observation itself was actually persisted.
+                # This is the write path that keeps review_cases (and
+                # therefore sensor.cognitive_core_pending_reviews)
+                # deduplicated per (device_id, classifier_name,
+                # hypothesis_category) instead of growing one entry per
+                # raw observation row.
+                if observation_id:
+                    self.storage.upsert_review_case(
+                        device_id=device.get("id") or "unknown",
+                        classifier_name=classifier_name,
+                        hypothesis_category=result.get("category") or "unknown",
+                        observation_id=observation_id,
+                    )
 
                 if result["confidence"] > best_score:
                     best_hypothesis = result

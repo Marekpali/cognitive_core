@@ -99,8 +99,10 @@ class HAAdapter:
         event_data = message.get("event", {}).get("data", {})
         action = event_data.get("action")
         device_id = event_data.get("device_id")
+        
+        print(f"[HA DEBUG] event action={action} device_id={device_id}")
 
-        if action == "create":
+        if action in {"create", "update"}:
             device = await self._get_device(device_id)
             if device and self.callback:
                 await self.callback("ha", device)

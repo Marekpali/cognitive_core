@@ -124,9 +124,24 @@ class Storage:
         # STEP 3: Ensure review columns exist (idempotent migration)
         self._ensure_review_columns(conn)
 
+        # STEP 5: Review cases table (materialized Human Review workflow
+        # state, separate from append-only classification_observations
+        # history). Must be created after classification_observations
+        # (FK dependency) and after review columns exist (backfill below
+        # reads review_status/human_decision).
+        self.init_review_cases_schema(cursor)
+
         # Commit ALL changes in one transaction
         conn.commit()
         conn.close()
+
+        # STEP 5: backfill/reconcile review_cases from history. Runs
+        # AFTER the schema transaction above is committed and closed -
+        # it opens its own connection via self.connect(), and an
+        # uncommitted CREATE TABLE on the local `conn` above would not
+        # yet be visible to a second connection to the same database
+        # file.
+        self.backfill_review_cases()
 
     def init_classification_observations_schema(self, cursor):
         """Create classification_observations table.
@@ -176,6 +191,59 @@ class Storage:
 
         print("[STORAGE] Indices created/verified (2 indices)")
         print("[STORAGE] classification_observations schema initialization complete - OK")
+
+    def init_review_cases_schema(self, cursor):
+        """Create review_cases table.
+
+        STEP 5: Materialized Human Review workflow state, separate from the
+        append-only classification_observations history.
+
+        Logical review identity key: (device_id, classifier_name,
+        hypothesis_category). Confidence is deliberately NOT part of the
+        key - it is an attribute of a hypothesis, not its identity
+        (corrections only ever touch hypothesis_category, never
+        confidence).
+
+        Called from init_schema() during system startup. Uses cursor from
+        init_schema() - commit happens in init_schema().
+        """
+        print("[STORAGE] Initializing review_cases schema...")
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS review_cases (
+                id                   TEXT PRIMARY KEY,
+                device_id            TEXT NOT NULL,
+                classifier_name      TEXT NOT NULL,
+                hypothesis_category  TEXT NOT NULL,
+
+                status               TEXT NOT NULL DEFAULT 'pending',
+                decision             TEXT,
+                corrected_category   TEXT,
+
+                last_observation_id  TEXT NOT NULL,
+                created_at           TEXT NOT NULL,
+                updated_at           TEXT NOT NULL,
+                decided_at           TEXT,
+
+                UNIQUE(device_id, classifier_name, hypothesis_category),
+                FOREIGN KEY(last_observation_id)
+                    REFERENCES classification_observations(id)
+            )
+        ''')
+
+        print("[STORAGE] Table review_cases created/verified")
+
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_review_cases_status
+            ON review_cases(status)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_review_cases_device
+            ON review_cases(device_id)
+        ''')
+
+        print("[STORAGE] Indices created/verified (2 indices)")
+        print("[STORAGE] review_cases schema initialization complete - OK")
 
     def _ensure_review_columns(self, conn) -> None:
         """STEP 3: Idempotent migration - add review columns if missing.
@@ -340,7 +408,8 @@ class Storage:
 
         LEGACY: This operates on review_queue + assets (STEP 1 architecture).
         For the STEP 3 Learning Loop (classification_observations), use
-        get_pending_reviews() instead.
+        get_pending_reviews() instead. For the STEP 5 Human Review
+        workflow, use get_pending_review_cases() instead.
         """
         conn = self.connect()
         cursor = conn.cursor()
@@ -495,6 +564,347 @@ class Storage:
             print(f"[STORAGE] WARNING: observation logging failed: {exc}")
             return None
 
+    def upsert_review_case(
+        self,
+        device_id: str,
+        classifier_name: str,
+        hypothesis_category: str,
+        observation_id: str,
+    ) -> str:
+        """Atomically create or refresh the logical review case.
+
+        STEP 5: single INSERT ... ON CONFLICT DO UPDATE ... WHERE, not a
+        SELECT-then-branch - closes the race window if two classification
+        callbacks for the same logical key ran concurrently.
+
+        The DO UPDATE is conditional (monotonic): last_observation_id
+        only advances if the incoming observation is actually newer than
+        the case's current evidence pointer, using the same deterministic
+        freshness rule as backfill_review_cases() - created_at DESC, id
+        DESC as tie-breaker. Without this guard, two concurrent upserts
+        for an older (O1) and a newer (O2) observation landing in the
+        "wrong" commit order could regress last_observation_id from O2
+        back to O1. If the incoming observation is not newer, SQLite's
+        UPSERT WHERE clause makes the UPDATE a no-op - the statement
+        still succeeds, nothing is written, no error is raised.
+
+        status, decision, corrected_category, decided_at are never part
+        of the DO UPDATE clause - a resolved case never reopens just
+        because the same hypothesis was observed again.
+        """
+        from uuid import uuid4
+
+        conn = self.connect()
+        cursor = conn.cursor()
+        now = datetime.utcnow().isoformat() + 'Z'
+        case_id = f"case_{uuid4().hex[:8]}"
+
+        cursor.execute('''
+            INSERT INTO review_cases (
+                id, device_id, classifier_name, hypothesis_category,
+                status, last_observation_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+            ON CONFLICT(device_id, classifier_name, hypothesis_category)
+            DO UPDATE SET
+                last_observation_id = excluded.last_observation_id,
+                updated_at = excluded.updated_at
+            WHERE
+                (SELECT created_at FROM classification_observations
+                 WHERE id = excluded.last_observation_id)
+                >
+                (SELECT created_at FROM classification_observations
+                 WHERE id = review_cases.last_observation_id)
+                OR (
+                    (SELECT created_at FROM classification_observations
+                     WHERE id = excluded.last_observation_id)
+                    =
+                    (SELECT created_at FROM classification_observations
+                     WHERE id = review_cases.last_observation_id)
+                    AND excluded.last_observation_id > review_cases.last_observation_id
+                )
+        ''', (case_id, device_id, classifier_name, hypothesis_category,
+              observation_id, now, now))
+        conn.commit()
+
+        cursor.execute('''
+            SELECT id FROM review_cases
+            WHERE device_id = ? AND classifier_name = ? AND hypothesis_category = ?
+        ''', (device_id, classifier_name, hypothesis_category))
+        real_case_id = cursor.fetchone()['id']
+        print(f"[STORAGE] Review case upserted: {real_case_id}")
+        return real_case_id
+
+    def get_pending_review_cases(self, limit: int = 50) -> List[Dict]:
+        """Get active review cases for the Human Review workflow.
+
+        STEP 5: Joins to classification_observations via
+        last_observation_id to surface current confidence/reasoning/
+        device_name for display, without duplicating that data into
+        review_cases itself.
+        """
+        conn = self.connect()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT
+                rc.id AS case_id,
+                rc.device_id,
+                rc.classifier_name,
+                rc.hypothesis_category,
+                rc.status,
+                rc.decision,
+                rc.corrected_category,
+                rc.created_at AS case_created_at,
+                rc.updated_at AS case_updated_at,
+                co.id AS observation_id,
+                co.device_name,
+                co.hypothesis_confidence,
+                co.hypothesis_reasoning
+            FROM review_cases rc
+            JOIN classification_observations co ON co.id = rc.last_observation_id
+            WHERE rc.status = 'pending'
+            ORDER BY rc.updated_at DESC
+            LIMIT ?
+        ''', (limit,))
+
+        return [dict(row) for row in cursor.fetchall()]
+
+    def resolve_review_case(
+        self,
+        case_id: str,
+        expected_observation_id: str,
+        decision: str,
+        reason: Optional[str] = None,
+        corrected_category: Optional[str] = None,
+        reviewed_by: str = 'human',
+    ) -> str:
+        """Resolve a review case, guarding against stale reviews.
+
+        STEP 5: expected_observation_id must match the case's current
+        last_observation_id or the resolution is refused ('stale') - if a
+        newer HA event refreshed the case since the reviewer loaded it,
+        the human would otherwise be recorded as having reviewed an
+        observation they never saw. The check-and-update is a single
+        UPDATE ... WHERE (case_id AND last_observation_id both matched),
+        closing the race window entirely rather than narrowing it.
+
+        decision is validated before any write. The review_cases UPDATE
+        and the classification_observations dual-write are one logical
+        operation via explicit try/except/rollback; the second UPDATE's
+        rowcount is verified too, so the case is never left 'resolved' if
+        the dual-write touched zero or more than one row.
+
+        Returns:
+            'resolved'   - resolved successfully
+            'stale'      - last_observation_id had moved on; nothing written
+            'not_found'  - no such case_id
+
+        Raises:
+            ValueError: invalid decision, or corrected_category
+                present/missing inconsistently with decision
+        """
+        valid_decisions = {"approved", "rejected", "corrected"}
+        if decision not in valid_decisions:
+            raise ValueError(
+                f"decision must be one of {valid_decisions}, got {decision!r}"
+            )
+        if decision == "corrected":
+            if not corrected_category:
+                raise ValueError(
+                    "corrected_category is required when decision='corrected'"
+                )
+        else:
+            if corrected_category is not None:
+                raise ValueError(
+                    f"corrected_category must be None when decision={decision!r}, "
+                    f"got {corrected_category!r}"
+                )
+
+        conn = self.connect()
+        cursor = conn.cursor()
+        now = datetime.utcnow().isoformat() + 'Z'
+
+        try:
+            cursor.execute('''
+                UPDATE review_cases
+                SET status = 'resolved',
+                    decision = ?,
+                    corrected_category = ?,
+                    decided_at = ?,
+                    updated_at = ?
+                WHERE id = ? AND last_observation_id = ?
+            ''', (decision, corrected_category, now, now, case_id, expected_observation_id))
+
+            if cursor.rowcount == 0:
+                conn.rollback()
+                cursor.execute('SELECT id FROM review_cases WHERE id = ?', (case_id,))
+                if cursor.fetchone() is None:
+                    print(f"[STORAGE] WARNING: resolve_review_case found no case for {case_id}")
+                    return 'not_found'
+                print(f"[STORAGE] WARNING: resolve_review_case stale - {case_id} "
+                      f"no longer points at {expected_observation_id}")
+                return 'stale'
+
+            cursor.execute('''
+                UPDATE classification_observations
+                SET review_status = 'reviewed',
+                    human_decision = ?,
+                    reviewed_at = ?,
+                    review_reason = ?,
+                    corrected_category = ?,
+                    reviewed_by = ?
+                WHERE id = ?
+            ''', (decision, now, reason, corrected_category, reviewed_by, expected_observation_id))
+
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"Expected exactly one observation {expected_observation_id} "
+                    f"to be updated, got {cursor.rowcount}"
+                )
+
+            conn.commit()
+            print(f"[STORAGE] Review case resolved: {case_id} ({decision})")
+            return 'resolved'
+
+        except Exception as exc:
+            conn.rollback()
+            print(f"[STORAGE] ERROR: resolve_review_case failed, rolled back: {exc}")
+            raise
+
+    def backfill_review_cases(self) -> Dict[str, int]:
+        """Idempotent backfill AND crash-recovery reconciliation.
+
+        STEP 5: derives TWO independent pieces of state per logical key
+        (device_id, classifier_name, hypothesis_category):
+
+        1. CURRENT EVIDENCE POINTER (last_observation_id) - the newest
+           observation regardless of review_status, ORDER BY created_at
+           DESC, id DESC.
+
+        2. HUMAN WORKFLOW STATE (status/decision/corrected_category/
+           decided_at) - derived ONLY from the newest genuinely reviewed
+           observation for that key (review_status='reviewed'), ORDER BY
+           reviewed_at DESC, created_at DESC, id DESC. If no observation
+           for the key was ever reviewed, workflow state is 'pending'/NULL.
+
+        Deriving both from the same "newest row" would incorrectly reopen
+        a case a human already resolved, whenever a later noisy
+        observation happens to be pending. Example: A1 reviewed/approved,
+        A2 pending, A3 pending -> migrates to status='resolved',
+        decision='approved' (from A1), last_observation_id=A3 (freshest
+        evidence) - not status='pending' just because A3 is newest.
+
+        For EXISTING review_cases (reconciliation path, e.g. after a
+        crash between committing an observation and calling
+        upsert_review_case() for it): only last_observation_id/updated_at
+        are refreshed if stale. status/decision/corrected_category/
+        decided_at are NEVER touched here - only upsert_review_case()/
+        resolve_review_case() at runtime are allowed to change workflow
+        state.
+
+        Safe to call on every startup.
+
+        Returns:
+            {"created": N, "reconciled": M}
+        """
+        conn = self.connect()
+        cursor = conn.cursor()
+        now = datetime.utcnow().isoformat() + 'Z'
+
+        # 1. Current evidence pointer: newest observation per key,
+        #    regardless of review_status.
+        cursor.execute('''
+            SELECT device_id, classifier_name, hypothesis_category,
+                   id AS observation_id
+            FROM (
+                SELECT *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY device_id, classifier_name, hypothesis_category
+                        ORDER BY created_at DESC, id DESC
+                    ) AS rn
+                FROM classification_observations
+            )
+            WHERE rn = 1
+        ''')
+        latest_evidence = {
+            (r['device_id'], r['classifier_name'], r['hypothesis_category']): r['observation_id']
+            for r in cursor.fetchall()
+        }
+
+        # 2. Human workflow state: newest REVIEWED observation per key, if any.
+        cursor.execute('''
+            SELECT device_id, classifier_name, hypothesis_category,
+                   human_decision, corrected_category, reviewed_at
+            FROM (
+                SELECT *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY device_id, classifier_name, hypothesis_category
+                        ORDER BY reviewed_at DESC, created_at DESC, id DESC
+                    ) AS rn
+                FROM classification_observations
+                WHERE review_status = 'reviewed'
+            )
+            WHERE rn = 1
+        ''')
+        latest_decision = {
+            (r['device_id'], r['classifier_name'], r['hypothesis_category']): r
+            for r in cursor.fetchall()
+        }
+
+        created = 0
+        reconciled = 0
+
+        for key, observation_id in latest_evidence.items():
+            device_id, classifier_name, hypothesis_category = key
+
+            cursor.execute('''
+                SELECT id, last_observation_id FROM review_cases
+                WHERE device_id = ? AND classifier_name = ? AND hypothesis_category = ?
+            ''', key)
+            existing = cursor.fetchone()
+
+            if existing is None:
+                from uuid import uuid4
+                decision_row = latest_decision.get(key)
+                if decision_row is not None:
+                    status = 'resolved'
+                    decision = decision_row['human_decision']
+                    corrected_category = decision_row['corrected_category']
+                    decided_at = decision_row['reviewed_at']
+                else:
+                    status = 'pending'
+                    decision = None
+                    corrected_category = None
+                    decided_at = None
+
+                case_id = f"case_{uuid4().hex[:8]}"
+                cursor.execute('''
+                    INSERT INTO review_cases (
+                        id, device_id, classifier_name, hypothesis_category,
+                        status, decision, corrected_category,
+                        last_observation_id, created_at, updated_at, decided_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    case_id, device_id, classifier_name, hypothesis_category,
+                    status, decision, corrected_category,
+                    observation_id, now, now, decided_at,
+                ))
+                created += 1
+
+            elif existing['last_observation_id'] != observation_id:
+                # Reconciliation only: refresh the evidence pointer, never
+                # touch workflow state on an existing case.
+                cursor.execute('''
+                    UPDATE review_cases
+                    SET last_observation_id = ?, updated_at = ?
+                    WHERE id = ?
+                ''', (observation_id, now, existing['id']))
+                reconciled += 1
+
+        conn.commit()
+        print(f"[STORAGE] backfill_review_cases: {created} created, {reconciled} reconciled")
+        return {"created": created, "reconciled": reconciled}
+
     def get_pending_reviews(
         self,
         limit: int = 50,
@@ -506,6 +916,12 @@ class Storage:
         stats, and export. All Learning Loop consumers should call this
         method rather than writing their own SQL against
         classification_observations.
+
+        NOTE (STEP 5): This method still reads/returns raw observation
+        rows and is retained for get_review_analytics()/history use.
+        The primary Human Review workflow now uses
+        get_pending_review_cases() instead, which is deduplicated to one
+        active case per logical hypothesis.
 
         Args:
             limit: maximum number of observations to return
@@ -560,41 +976,38 @@ class Storage:
         return [dict(row) for row in cursor.fetchall()]
 
     def count_pending_reviews(self) -> int:
-        """Count observations awaiting human review.
+        """Count active review cases awaiting human decision.
 
-        STEP 4A.1: Foundation for review workflow notifications
-        (pending-count CLI, Home Assistant sensor, notifications).
-        Deliberately minimal - a single number, no breakdown - since
-        the only current consumer needs to answer "are there any
-        observations to review right now?"
+        STEP 5: Counts review_cases.status='pending', not raw
+        classification_observations rows - a device with 5 repeated,
+        unresolved observations of the same hypothesis counts once here,
+        not five times.
 
-        STEP 4A.2 thread-safety note: this method uses its own
-        short-lived connection instead of self.connect(). It is the
-        one Storage method invoked via asyncio.to_thread() (see
-        ha_sensor.update_pending_reviews(), called from core.py and
-        main.py). sqlite3 connections are thread-affine by default
-        (check_same_thread=True) and to_thread() runs on the executor's
-        thread pool - a different thread than whichever one first
-        created self.connection via self.connect(). Reusing the cached
-        connection across threads would raise:
+        STEP 4A.2 thread-safety note (preserved under STEP 5): this
+        method uses its own short-lived connection instead of
+        self.connect(). It is the one Storage method invoked via
+        asyncio.to_thread() (see ha_sensor.update_pending_reviews(),
+        called from core.py and main.py). sqlite3 connections are
+        thread-affine by default (check_same_thread=True) and
+        to_thread() runs on the executor's thread pool - a different
+        thread than whichever one first created self.connection via
+        self.connect(). Reusing the cached connection across threads
+        would raise:
             sqlite3.ProgrammingError: SQLite objects created in a
             thread can only be used in that same thread
         A plain `with sqlite3.connect(...) as conn:` does NOT avoid a
         connection leak here - Connection's context manager only
         commits/rolls back the transaction on exit, it does not close
-        the connection. Given how often this method is called (every
-        device detection, every 60s reconcile tick, every CLI
-        decision), that would leak a file handle per call. Explicit
-        try/finally close() is used instead.
+        the connection. Explicit try/finally close() is used instead.
 
         Returns:
-            Count of classification_observations with review_status='pending'
+            Count of review_cases with status='pending'
         """
         conn = sqlite3.connect(self.db_path)
         try:
             cursor = conn.execute('''
-                SELECT COUNT(*) FROM classification_observations
-                WHERE review_status = 'pending'
+                SELECT COUNT(*) FROM review_cases
+                WHERE status = 'pending'
             ''')
             return int(cursor.fetchone()[0])
         finally:
@@ -610,6 +1023,16 @@ class Storage:
         count_pending_reviews() - see that method's docstring for why
         self.connect()'s cached connection is not used here: this may
         eventually be called from the same to_thread/CLI contexts).
+
+        NOTE (STEP 5): This continues to read classification_observations
+        directly and is unaffected by the review_cases workflow layer -
+        resolve_review_case() dual-writes review_status/human_decision/
+        reviewed_at/review_reason/corrected_category/reviewed_by onto the
+        specific observation row it resolved, so this method's queries
+        keep working unchanged. "pending" here means "observation rows
+        never reviewed", which is a different number than
+        sensor.cognitive_core_pending_reviews (active review_cases) -
+        these are two distinct, intentionally separate metrics.
 
         Definitions:
         - reviewed = human_decision is not NULL (approved, rejected,
@@ -815,6 +1238,10 @@ class Storage:
 
         STEP 3C: Human decision - approve.
 
+        LEGACY (STEP 5): Superseded by resolve_review_case() for the
+        primary Human Review workflow. Retained for any external callers
+        and for get_review_analytics() consistency.
+
         Args:
             observation_id: the classification_observations.id to update
             reason: optional free-text note from the reviewer
@@ -859,6 +1286,10 @@ class Storage:
         no correct category supplied).
 
         STEP 3C: Human decision - reject.
+
+        LEGACY (STEP 5): Superseded by resolve_review_case() for the
+        primary Human Review workflow. Retained for any external callers
+        and for get_review_analytics() consistency.
 
         Args:
             observation_id: the classification_observations.id to update
@@ -905,6 +1336,10 @@ class Storage:
         and the human supplies the correct category.
 
         STEP 3C: Human decision - correct.
+
+        LEGACY (STEP 5): Superseded by resolve_review_case() for the
+        primary Human Review workflow. Retained for any external callers
+        and for get_review_analytics() consistency.
 
         The original hypothesis_category is preserved as-is (it stays
         the classifier's actual guess). corrected_category stores the

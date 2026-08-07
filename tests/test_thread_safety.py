@@ -16,6 +16,14 @@ the connection object created on the main thread.
 
 After the fix: count_pending_reviews() opens and closes its own
 connection, so it works correctly regardless of which thread calls it.
+
+STEP 5 update: count_pending_reviews() now counts review_cases.status=
+'pending' instead of raw classification_observations rows. This test's
+insert_test_observation() helper now also drives upsert_review_case()
+so it exercises the real production path - review_cases.status is what
+count_pending_reviews() actually reads, so the count=1 assertions below
+must be backed by a real review_cases row, not just a raw observation
+insert.
 """
 
 import asyncio
@@ -41,6 +49,15 @@ def insert_test_observation(storage, obs_id):
          "motion_sensor", 0.8, "ha", "2026-08-03T00:00:00Z", f"Test {obs_id}")
     )
     conn.commit()
+    # STEP 5: also create the logical review case, exercising the real
+    # production path so count_pending_reviews() (which now counts
+    # review_cases) sees this observation as actionable.
+    storage.upsert_review_case(
+        device_id=f"device_{obs_id}",
+        classifier_name="motion_sensor",
+        hypothesis_category="motion_sensor",
+        observation_id=obs_id,
+    )
 
 
 def test_cross_thread_count():
@@ -75,19 +92,19 @@ def test_cross_thread_count():
         worker_thread.join(timeout=5)
 
         if "error" in error_holder:
-            print(f"   ✗ FAILED: cross-thread call raised: {error_holder['error']}")
+            print(f"   âś— FAILED: cross-thread call raised: {error_holder['error']}")
             print(f"     (this is the exact bug the fix addresses)")
             return False
 
         if "count" not in result_holder:
-            print("   ✗ FAILED: worker thread did not complete")
+            print("   âś— FAILED: worker thread did not complete")
             return False
 
         if result_holder["count"] == 1:
-            print(f"   ✓ PASS: count_pending_reviews() returned {result_holder['count']} "
+            print(f"   âś“ PASS: count_pending_reviews() returned {result_holder['count']} "
                   f"from a different thread, no ProgrammingError raised")
         else:
-            print(f"   ✗ FAILED: expected count=1, got {result_holder['count']}")
+            print(f"   âś— FAILED: expected count=1, got {result_holder['count']}")
             return False
 
         # Step 3: confirm the main thread's connection is untouched and
@@ -97,9 +114,9 @@ def test_cross_thread_count():
         insert_test_observation(storage, "obs_after")
         conn = storage.connect()
         if conn is main_thread_conn:
-            print("   ✓ Main thread connection object unchanged, still usable")
+            print("   âś“ Main thread connection object unchanged, still usable")
         else:
-            print("   ✗ Main thread connection was unexpectedly replaced")
+            print("   âś— Main thread connection was unexpectedly replaced")
             return False
 
         # Windows-specific: TemporaryDirectory's cleanup on __exit__ will
@@ -131,13 +148,13 @@ async def test_via_actual_asyncio_to_thread():
         try:
             count = await asyncio.to_thread(storage.count_pending_reviews)
         except Exception as exc:
-            print(f"   ✗ FAILED: asyncio.to_thread() call raised: {exc}")
+            print(f"   âś— FAILED: asyncio.to_thread() call raised: {exc}")
             return False
 
         if count == 1:
-            print(f"   ✓ PASS: real asyncio.to_thread() call succeeded, count={count}")
+            print(f"   âś“ PASS: real asyncio.to_thread() call succeeded, count={count}")
         else:
-            print(f"   ✗ FAILED: expected count=1, got {count}")
+            print(f"   âś— FAILED: expected count=1, got {count}")
             return False
 
         # Windows-specific cleanup requirement - see comment in
@@ -160,12 +177,12 @@ def main():
 
     if result1 and result2:
         print("=" * 60)
-        print("✓ ALL TESTS PASSED")
+        print("âś“ ALL TESTS PASSED")
         print("=" * 60)
         return True
     else:
         print("=" * 60)
-        print("✗ SOME TESTS FAILED")
+        print("âś— SOME TESTS FAILED")
         print("=" * 60)
         return False
 

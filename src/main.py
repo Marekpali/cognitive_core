@@ -8,11 +8,11 @@ from src.ha_sensor import update_pending_reviews
 async def main_loop(core: CognitiveCore):
     """Main event loop"""
     await core.start()
-    
+
     # Listen for device signals
     for adapter in core.adapters.values():
         asyncio.create_task(adapter.listen(core.on_device_detected))
-    
+
     # STEP 4A.2: periodic reconcile of the pending-reviews sensor.
     # Event-driven pushes (core.py's start()/on_device_detected(), and
     # show_review_queue()'s approve/reject/correct handlers below) are
@@ -46,7 +46,7 @@ async def test_mock_device():
     """Test with mock device"""
     core = CognitiveCore()
     await core.start()
-    
+
     test_device = {
         'id': 'shelly_123',
         'name': 'Shelly Pro 3EM',
@@ -57,13 +57,13 @@ async def test_mock_device():
             {'name': 'Shelly Phase A', 'domain': 'sensor'},
         ]
     }
-    
+
     mock_adapter = core.adapters['mock']
     await mock_adapter.send_test_device(
         core.on_device_detected,
         test_device
     )
-    
+
     print("\n[CLI] Review Queue:")
     reviews = core.storage.get_pending_asset_reviews()
     for i, review in enumerate(reviews, 1):
@@ -87,42 +87,61 @@ KNOWN_CATEGORIES = {
 # TODO(STEP 4+): show_review_queue() currently mixes the CLI (print/input)
 # with the data layer (Storage calls) in one function. This is fine at
 # CLI-only scale. Once a Web UI or REST API is added, split this into:
-#   - a pure function that yields pending observations + accepts decisions
+#   - a pure function that yields pending review cases + accepts decisions
 #   - a thin CLI adapter that only handles print/input
 # so the UI and CLI can share the same review logic without duplicating it.
 def show_review_queue():
-    """CLI: Learning Loop review queue (STEP 3C).
+    """CLI: Human Review workflow (STEP 5).
 
-    Operates on classification_observations via Storage.get_pending_reviews().
-    This is the current, primary review workflow.
+    Operates on review_cases via Storage.get_pending_review_cases()/
+    resolve_review_case(). This is the current, primary review workflow -
+    one entry per logical (device, classifier, hypothesis_category) case,
+    not one entry per raw observation row.
     """
     storage = Storage()
 
-    print("\n[CLI] Pending Observations:")
-    observations = storage.get_pending_reviews()
+    print("\n[CLI] Pending Review Cases:")
+    cases = storage.get_pending_review_cases()
 
-    if not observations:
-        print("[CLI] No pending observations")
+    if not cases:
+        print("[CLI] No pending review cases")
         return
 
-    for i, obs in enumerate(observations, 1):
-        print(f"\n[{i}] {obs['device_name'] or obs['device_id']}")
-        print(f"    Classifier: {obs['classifier_name']}")
-        print(f"    Category: {obs['hypothesis_category']}")
-        print(f"    Confidence: {obs['hypothesis_confidence']:.0%}")
-        print(f"    Reasoning: {obs['hypothesis_reasoning']}")
-        print(f"    Observation ID: {obs['id']}")
+    for i, case in enumerate(cases, 1):
+        print(f"\n[{i}] {case['device_name'] or case['device_id']}")
+        print(f"    Classifier: {case['classifier_name']}")
+        print(f"    Category: {case['hypothesis_category']}")
+        print(f"    Confidence: {case['hypothesis_confidence']:.0%}")
+        print(f"    Reasoning: {case['hypothesis_reasoning']}")
+        print(f"    Case ID: {case['case_id']}")
 
         choice = input("    [a]pprove / [r]eject / [c]orrect / [s]kip > ").lower()
 
         if choice == 'a':
-            storage.approve_observation(obs['id'])
-            print("    ✓ Approved")
-            update_pending_reviews(storage)
+            result = storage.resolve_review_case(
+                case['case_id'], expected_observation_id=case['observation_id'],
+                decision='approved',
+            )
+            if result == 'resolved':
+                print("    âś“ Approved")
+                update_pending_reviews(storage)
+            elif result == 'stale':
+                print("    âš  This case changed since it was loaded (new observation "
+                      "arrived). Skipped - re-run review to see the current state.")
+            elif result == 'not_found':
+                print("    ! Review case no longer exists. Skipped.")
         elif choice == 'r':
-            storage.reject_observation(obs['id'])
-            print("    ✗ Rejected")
-            update_pending_reviews(storage)
+            result = storage.resolve_review_case(
+                case['case_id'], expected_observation_id=case['observation_id'],
+                decision='rejected',
+            )
+            if result == 'resolved':
+                print("    âś— Rejected")
+                update_pending_reviews(storage)
+            elif result == 'stale':
+                print("    âš  This case changed since it was loaded. Skipped.")
+            elif result == 'not_found':
+                print("    ! Review case no longer exists. Skipped.")
         elif choice == 'c':
             print(f"    Known categories: {', '.join(sorted(KNOWN_CATEGORIES))}")
             corrected_category = input("    Correct category > ").strip()
@@ -132,9 +151,17 @@ def show_review_queue():
                 print(f"    ! Unknown category '{corrected_category}', skipping")
                 print(f"    ! Must be one of: {', '.join(sorted(KNOWN_CATEGORIES))}")
             else:
-                storage.correct_observation(obs['id'], corrected_category)
-                update_pending_reviews(storage)
-                print(f"    ~ Corrected to '{corrected_category}'")
+                result = storage.resolve_review_case(
+                    case['case_id'], expected_observation_id=case['observation_id'],
+                    decision='corrected', corrected_category=corrected_category,
+                )
+                if result == 'resolved':
+                    update_pending_reviews(storage)
+                    print(f"    ~ Corrected to '{corrected_category}'")
+                elif result == 'stale':
+                    print("    âš  This case changed since it was loaded. Skipped.")
+                elif result == 'not_found':
+                    print("    ! Review case no longer exists. Skipped.")
         elif choice == 's':
             print("    ~ Skipped")
 def show_legacy_review_queue():
@@ -142,38 +169,38 @@ def show_legacy_review_queue():
 
     Operates on review_queue + assets via Storage.get_pending_asset_reviews().
     Kept for backward compatibility. Not the primary workflow anymore -
-    use 'review' for the Learning Loop instead.
+    use 'review' for the STEP 5 Human Review workflow instead.
     """
     storage = Storage()
-    
+
     print("\n[CLI] Pending Reviews (legacy):")
     reviews = storage.get_pending_asset_reviews()
-    
+
     if not reviews:
         print("[CLI] No pending reviews")
         return
-    
+
     for i, review in enumerate(reviews, 1):
         print(f"\n[{i}] {review['name']}")
         print(f"    Category: {review['hypothesis_category']}")
         print(f"    Confidence: {review['hypothesis_confidence']:.0%}")
         print(f"    Reasoning: {review['hypothesis_reasoning']}")
         print(f"    Review ID: {review['review_id']}")
-        
+
         choice = input("    [y]es / [n]o / [s]kip > ").lower()
-        
+
         if choice == 'y':
             storage.approve_review(review['review_id'])
-            print("    ✓ Approved")
+            print("    âś“ Approved")
         elif choice == 'n':
             storage.reject_review(review['review_id'])
-            print("    ✗ Rejected")
+            print("    âś— Rejected")
         elif choice == 's':
             print("    ~ Skipped")
 def show_review_count():
-    """CLI: Print the number of observations awaiting review.
+    """CLI: Print the number of active review cases awaiting review.
 
-    STEP 4A.1: Foundation for review workflow notifications.
+    STEP 4A.1 / STEP 5: Foundation for review workflow notifications.
     """
     storage = Storage()
     count = storage.count_pending_reviews()
@@ -185,6 +212,11 @@ def show_review_stats():
     No SQL here - all aggregation logic lives in Storage, so any future
     consumer (Web UI, REST API) can reuse the exact same data without
     duplicating queries.
+
+    NOTE (STEP 5): These numbers are derived from classification_observations
+    history (raw rows), not from review_cases (active cases) - see
+    get_review_analytics()'s docstring for why these are intentionally
+    two different metrics.
     """
     storage = Storage()
     analytics = storage.get_review_analytics()
@@ -233,7 +265,7 @@ def show_review_stats():
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         command = sys.argv[1]
-        
+
         if command == 'review':
             show_review_queue()
         elif command == 'legacy-review':
