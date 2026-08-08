@@ -72,7 +72,7 @@ def test_publish_success():
 
             if result is not True:
                 print(f"   âś— Expected True, got {result}")
-                return False
+                assert False
 
             call_args = mock_post.call_args
             url = call_args[0][0]
@@ -91,10 +91,10 @@ def test_publish_success():
             for ok, msg in checks:
                 if not ok:
                     print(f"   âś— {msg}")
-                    return False
+                    assert False
             print(f"   âś“ POST called correctly, no real network hit")
     print()
-    return True
+
 
 
 def test_publish_no_token():
@@ -106,13 +106,13 @@ def test_publish_no_token():
 
             if result is not False:
                 print(f"   âś— Expected False, got {result}")
-                return False
+                assert False
             if mock_post.called:
                 print(f"   âś— requests.post should NOT have been called")
-                return False
+                assert False
             print("   âś“ Returns False, no HTTP call attempted")
     print()
-    return True
+
 
 
 def test_publish_network_error():
@@ -125,14 +125,14 @@ def test_publish_network_error():
                 result = ha_sensor.publish_pending_reviews(2)
             except Exception as exc:
                 print(f"   âś— Exception propagated (should have been caught): {exc}")
-                return False
+                assert False
 
             if result is not False:
                 print(f"   âś— Expected False, got {result}")
-                return False
+                assert False
             print("   âś“ Returns False, exception caught and not propagated")
     print()
-    return True
+
 
 
 def test_update_pending_reviews_integration():
@@ -155,12 +155,12 @@ def test_update_pending_reviews_integration():
 
                 if result != 2:
                     print(f"   âś— Expected count 2, got {result}")
-                    return False
+                    assert False
 
                 payload = mock_post.call_args[1]["json"]
                 if payload["state"] != "2":
                     print(f"   âś— Published state should be '2', got {payload['state']}")
-                    return False
+                    assert False
 
                 print(f"   âś“ Counted 2 pending, published state='2' via mocked HTTP")
 
@@ -173,7 +173,7 @@ def test_update_pending_reviews_integration():
         if storage.connection:
             storage.connection.close()
     print()
-    return True
+
 
 
 def main():
@@ -183,22 +183,22 @@ def main():
     print()
 
     results = [
-        test_publish_success(),
-        test_publish_no_token(),
-        test_publish_network_error(),
-        test_update_pending_reviews_integration(),
+        check_publish_success(),
+        check_publish_no_token(),
+        check_publish_network_error(),
+        check_update_pending_reviews_integration(),
     ]
 
     if all(results):
         print("=" * 60)
         print("âś“ ALL TESTS PASSED")
         print("=" * 60)
-        return True
+    
     else:
         print("=" * 60)
         print(f"âś— {results.count(False)} TEST(S) FAILED")
         print("=" * 60)
-        return False
+        assert False
 
 
 if __name__ == "__main__":

@@ -61,7 +61,7 @@ def insert_test_observation(storage, obs_id):
     )
 
 
-def test_cross_thread_count():
+def check_cross_thread_count():
     print("1. Testing count_pending_reviews() called from a different")
     print("   thread than the one that created self.connection...")
     print()
@@ -133,7 +133,7 @@ def test_cross_thread_count():
 
 
 @pytest.mark.asyncio
-async def test_via_actual_asyncio_to_thread():
+async def check_via_actual_asyncio_to_thread():
     print("3. Testing via real asyncio.to_thread() (not simulated)...")
     print()
 
@@ -174,8 +174,8 @@ def main():
     print("=" * 60)
     print()
 
-    result1 = test_cross_thread_count()
-    result2 = asyncio.run(test_via_actual_asyncio_to_thread())
+    result1 = check_cross_thread_count()
+    result2 = asyncio.run(check_via_actual_asyncio_to_thread())
 
     if result1 and result2:
         print("=" * 60)
