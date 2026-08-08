@@ -3,7 +3,7 @@
 import sqlite3
 import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, List
 import json
 
@@ -342,7 +342,7 @@ class Storage:
         conn = self.connect()
         cursor = conn.cursor()
 
-        now = datetime.utcnow().isoformat() + 'Z'
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         cursor.execute('''
             INSERT OR REPLACE INTO assets (
@@ -392,7 +392,7 @@ class Storage:
         cursor = conn.cursor()
 
         review_id = f"review_{uuid4().hex[:8]}"
-        now = datetime.utcnow().isoformat() + 'Z'
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         cursor.execute('''
             INSERT INTO review_queue (id, asset_id, status, created_at)
@@ -439,7 +439,7 @@ class Storage:
         conn = self.connect()
         cursor = conn.cursor()
 
-        now = datetime.utcnow().isoformat() + 'Z'
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         cursor.execute('''
             UPDATE review_queue
@@ -469,7 +469,7 @@ class Storage:
         conn = self.connect()
         cursor = conn.cursor()
 
-        now = datetime.utcnow().isoformat() + 'Z'
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         cursor.execute('''
             UPDATE review_queue
@@ -516,7 +516,7 @@ class Storage:
         cursor = conn.cursor()
 
         observation_id = f"obs_{uuid4().hex[:12]}"
-        now = datetime.utcnow().isoformat() + 'Z'
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         try:
             cursor.execute('''
@@ -596,7 +596,7 @@ class Storage:
 
         conn = self.connect()
         cursor = conn.cursor()
-        now = datetime.utcnow().isoformat() + 'Z'
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         case_id = f"case_{uuid4().hex[:8]}"
 
         cursor.execute('''
@@ -722,7 +722,7 @@ class Storage:
 
         conn = self.connect()
         cursor = conn.cursor()
-        now = datetime.utcnow().isoformat() + 'Z'
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         try:
             cursor.execute('''
@@ -809,7 +809,7 @@ class Storage:
         """
         conn = self.connect()
         cursor = conn.cursor()
-        now = datetime.utcnow().isoformat() + 'Z'
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         # 1. Current evidence pointer: newest observation per key,
         #    regardless of review_status.
@@ -1378,7 +1378,7 @@ class Storage:
         conn = self.connect()
         cursor = conn.cursor()
 
-        now = datetime.utcnow().isoformat() + 'Z'
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         cursor.execute('''
             UPDATE classification_observations
@@ -1427,7 +1427,7 @@ class Storage:
         conn = self.connect()
         cursor = conn.cursor()
 
-        now = datetime.utcnow().isoformat() + 'Z'
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         cursor.execute('''
             UPDATE classification_observations
@@ -1484,7 +1484,7 @@ class Storage:
         conn = self.connect()
         cursor = conn.cursor()
 
-        now = datetime.utcnow().isoformat() + 'Z'
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         cursor.execute('''
             UPDATE classification_observations
@@ -1512,7 +1512,7 @@ class Storage:
         conn = self.connect()
         cursor = conn.cursor()
 
-        now = datetime.utcnow().isoformat() + 'Z'
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         timestamp = data.get('timestamp', now)
 
         cursor.execute('''

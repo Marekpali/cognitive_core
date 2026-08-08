@@ -3,7 +3,7 @@
 import pytest
 from pathlib import Path
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 
 from src.storage import Storage
 
@@ -43,7 +43,7 @@ def test_save_and_load_asset(temp_storage):
             'reasoning': 'Test'
         },
         'lifecycle_state': 'provisional',
-        'lifecycle_discovered_at': datetime.utcnow().isoformat() + 'Z'
+        'lifecycle_discovered_at': datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     }
 
     asset_id = temp_storage.save_asset(asset)
@@ -74,7 +74,7 @@ def test_review_queue(temp_storage):
             'confidence': 0.85
         },
         'lifecycle_state': 'provisional',
-        'lifecycle_discovered_at': datetime.utcnow().isoformat() + 'Z'
+        'lifecycle_discovered_at': datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     }
 
     temp_storage.save_asset(asset)
@@ -212,7 +212,7 @@ def _label(temp_storage, obs_id, decision, corrected_category=None):
         "UPDATE classification_observations "
         "SET review_status='reviewed', human_decision=?, corrected_category=?, "
         "reviewed_at=? WHERE id=?",
-        (decision, corrected_category, datetime.utcnow().isoformat() + 'Z', obs_id),
+        (decision, corrected_category, datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), obs_id),
     )
     conn.commit()
 
@@ -374,7 +374,7 @@ def test_backfill_reconstructs_state_without_reopening(temp_storage):
     conn.execute(
         "UPDATE classification_observations SET review_status='reviewed', "
         "human_decision='approved', reviewed_at=? WHERE id=?",
-        (datetime.utcnow().isoformat() + 'Z', a1),
+        (datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), a1),
     )
     conn.commit()
 
