@@ -27,6 +27,7 @@ insert.
 """
 
 import asyncio
+import pytest
 import sys
 import tempfile
 import threading
@@ -131,6 +132,7 @@ def test_cross_thread_count():
     return True
 
 
+@pytest.mark.asyncio
 async def test_via_actual_asyncio_to_thread():
     print("3. Testing via real asyncio.to_thread() (not simulated)...")
     print()

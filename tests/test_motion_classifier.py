@@ -11,10 +11,10 @@ def classifier():
 async def test_motion_class_only(classifier):
     """Pure motion device — device_class=motion only"""
     device = {
-        "name": "Motion Sensor",
+        "name": "Hallway Sensor",
         "entities": [
             {
-                "entity_id": "binary_sensor.motion_1",
+                "entity_id": "binary_sensor.hallway_1",
                 "domain": "binary_sensor",
                 "device_class": "motion"
             }

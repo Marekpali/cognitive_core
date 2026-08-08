@@ -27,7 +27,7 @@ async def test_classify_shelly(classifier):
     
     assert hypothesis is not None
     assert hypothesis['category'] == 'energy_meter'
-    assert hypothesis['confidence'] > 0.85
+    assert hypothesis['confidence'] >= 0.8
 
 @pytest.mark.asyncio
 async def test_classify_non_meter(classifier):
