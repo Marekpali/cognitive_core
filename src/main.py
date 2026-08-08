@@ -123,10 +123,10 @@ def show_review_queue():
                 decision='approved',
             )
             if result == 'resolved':
-                print("    âś“ Approved")
+                print("    ✓ Approved")
                 update_pending_reviews(storage)
             elif result == 'stale':
-                print("    âš  This case changed since it was loaded (new observation "
+                print("    ⚠ This case changed since it was loaded (new observation "
                       "arrived). Skipped - re-run review to see the current state.")
             elif result == 'not_found':
                 print("    ! Review case no longer exists. Skipped.")
@@ -136,10 +136,10 @@ def show_review_queue():
                 decision='rejected',
             )
             if result == 'resolved':
-                print("    âś— Rejected")
+                print("    ✗ Rejected")
                 update_pending_reviews(storage)
             elif result == 'stale':
-                print("    âš  This case changed since it was loaded. Skipped.")
+                print("    ⚠ This case changed since it was loaded. Skipped.")
             elif result == 'not_found':
                 print("    ! Review case no longer exists. Skipped.")
         elif choice == 'c':
@@ -159,7 +159,7 @@ def show_review_queue():
                     update_pending_reviews(storage)
                     print(f"    ~ Corrected to '{corrected_category}'")
                 elif result == 'stale':
-                    print("    âš  This case changed since it was loaded. Skipped.")
+                    print("    ⚠ This case changed since it was loaded. Skipped.")
                 elif result == 'not_found':
                     print("    ! Review case no longer exists. Skipped.")
         elif choice == 's':
@@ -191,10 +191,10 @@ def show_legacy_review_queue():
 
         if choice == 'y':
             storage.approve_review(review['review_id'])
-            print("    âś“ Approved")
+            print("    ✓ Approved")
         elif choice == 'n':
             storage.reject_review(review['review_id'])
-            print("    âś— Rejected")
+            print("    ✗ Rejected")
         elif choice == 's':
             print("    ~ Skipped")
 def show_review_count():
@@ -262,6 +262,40 @@ def show_review_stats():
         for entry in analytics["problematic_devices"]:
             name = entry["device_name"] or entry["device_id"]
             print(f"- {name}: {entry['incorrect_count']} incorrect classification(s)")
+def show_correction_patterns():
+    """CLI: Print correction patterns derived from human review decisions.
+
+    STEP 7 (first use of get_correction_patterns(), introduced passively
+    in STEP 6 / deployed in STEP 6.1): shows where humans most often
+    correct a classifier's guess, so a person can decide whether a
+    classifier rule needs manual improvement.
+
+    Read-only and purely informational. Calling this does not change any
+    classifier behavior, confidence, or rule - Cognitive Core does not
+    act on this data by itself. See docs/STEP5_ARCHITECTURE.md's "Non-Goals"
+    section: information flows up to the human, authority never flows
+    down from the system.
+
+    Can raise RuntimeError if get_correction_patterns() detects an
+    integrity violation (more than one labelled observation for the same
+    logical review case) - that is intentional and surfaces here as-is,
+    rather than being silently swallowed, since it means the underlying
+    data can no longer be trusted without investigation.
+    """
+    storage = Storage()
+    patterns = storage.get_correction_patterns()
+
+    if not patterns:
+        print("No correction patterns yet.")
+        return
+
+    print("Correction Patterns")
+    print()
+    for p in patterns:
+        print(f"{p['classifier_name']} / {p['hypothesis_category']}")
+        print(f"  corrected to: {p['corrected_category']}")
+        print(f"  {p['correction_count']} of {p['sample_size']} reviewed case(s)")
+        print()
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         command = sys.argv[1]
@@ -274,6 +308,8 @@ if __name__ == '__main__':
             show_review_count()
         elif command == 'review-stats':
             show_review_stats()
+        elif command == 'correction-patterns':
+            show_correction_patterns()
         elif command == 'test':
             asyncio.run(test_mock_device())
     else:
