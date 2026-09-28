@@ -133,6 +133,124 @@ def test_stale_review_is_refused(temp_storage):
     assert temp_storage.count_pending_reviews() == 1  # untouched, still pending
 
 
+# ---------------------------------------------------------------------------
+# STEP 6.3: human decisions are immutable (pending -> resolved only)
+# ---------------------------------------------------------------------------
+
+def _decision_state(temp_storage, case_id, obs_id):
+    """Snapshot of every field a resolution writes, on both tables."""
+    conn = temp_storage.connect()
+    case = conn.execute(
+        "SELECT status, decision, corrected_category, decided_at "
+        "FROM review_cases WHERE id = ?", (case_id,)
+    ).fetchone()
+    obs = conn.execute(
+        "SELECT review_status, human_decision, corrected_category, reviewed_at "
+        "FROM classification_observations WHERE id = ?", (obs_id,)
+    ).fetchone()
+    return dict(case), dict(obs)
+
+
+def _resolved_case(temp_storage, decision, corrected_category=None):
+    obs = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    case_id = temp_storage.upsert_review_case("dev1", "env", "environmental", obs)
+    result = temp_storage.resolve_review_case(
+        case_id, expected_observation_id=obs, decision=decision,
+        corrected_category=corrected_category,
+    )
+    assert result == "resolved"
+    return case_id, obs
+
+
+def test_pending_to_approved_succeeds(temp_storage):
+    case_id, obs = _resolved_case(temp_storage, "approved")
+    case, row = _decision_state(temp_storage, case_id, obs)
+    assert case["status"] == "resolved"
+    assert case["decision"] == "approved"
+    assert row["human_decision"] == "approved"
+
+
+def test_pending_to_corrected_succeeds(temp_storage):
+    case_id, obs = _resolved_case(temp_storage, "corrected", "occupancy")
+    case, row = _decision_state(temp_storage, case_id, obs)
+    assert case["decision"] == "corrected"
+    assert case["corrected_category"] == "occupancy"
+    assert row["corrected_category"] == "occupancy"
+
+
+def test_approved_cannot_be_re_resolved_as_corrected(temp_storage):
+    case_id, obs = _resolved_case(temp_storage, "approved")
+    result = temp_storage.resolve_review_case(
+        case_id, expected_observation_id=obs,
+        decision="corrected", corrected_category="occupancy",
+    )
+    assert result == "already_resolved"
+    case, row = _decision_state(temp_storage, case_id, obs)
+    assert case["decision"] == "approved" and case["corrected_category"] is None
+    assert row["human_decision"] == "approved" and row["corrected_category"] is None
+
+
+def test_corrected_cannot_be_re_resolved_as_approved(temp_storage):
+    case_id, obs = _resolved_case(temp_storage, "corrected", "occupancy")
+    result = temp_storage.resolve_review_case(
+        case_id, expected_observation_id=obs, decision="approved"
+    )
+    assert result == "already_resolved"
+    case, row = _decision_state(temp_storage, case_id, obs)
+    assert case["decision"] == "corrected"
+    assert row["human_decision"] == "corrected"
+
+
+def test_refused_re_resolution_leaves_original_decision_untouched(temp_storage):
+    case_id, obs = _resolved_case(temp_storage, "corrected", "occupancy")
+    before = _decision_state(temp_storage, case_id, obs)
+
+    for decision, category in (("approved", None), ("rejected", None),
+                               ("corrected", "environmental")):
+        result = temp_storage.resolve_review_case(
+            case_id, expected_observation_id=obs,
+            decision=decision, corrected_category=category,
+        )
+        assert result == "already_resolved"
+
+    # decision, corrected_category and decided_at/reviewed_at all unchanged
+    assert _decision_state(temp_storage, case_id, obs) == before
+
+
+def test_resolved_case_with_newer_evidence_reports_already_resolved(temp_storage):
+    # After resolution, a later observation advances last_observation_id.
+    # A resolve attempt is refused as already_resolved (the fundamental
+    # reason), not as stale.
+    case_id, obs1 = _resolved_case(temp_storage, "approved")
+    obs2 = _obs(temp_storage, "g2", "dev1", "env", "environmental")
+    temp_storage.upsert_review_case("dev1", "env", "environmental", obs2)
+
+    result = temp_storage.resolve_review_case(
+        case_id, expected_observation_id=obs2, decision="rejected"
+    )
+    assert result == "already_resolved"
+    case, _ = _decision_state(temp_storage, case_id, obs1)
+    assert case["decision"] == "approved"
+
+
+def test_resolve_refuses_to_overwrite_already_labelled_observation(temp_storage):
+    # Defense in depth: a pending case whose evidence row already carries
+    # a human_decision (only reachable via the legacy *_observation()
+    # methods) must not have that decision overwritten by the dual-write.
+    obs = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    case_id = temp_storage.upsert_review_case("dev1", "env", "environmental", obs)
+    temp_storage.approve_observation(obs)
+
+    with pytest.raises(RuntimeError):
+        temp_storage.resolve_review_case(
+            case_id, expected_observation_id=obs,
+            decision="corrected", corrected_category="occupancy",
+        )
+    case, row = _decision_state(temp_storage, case_id, obs)
+    assert case["status"] == "pending"  # rolled back
+    assert row["human_decision"] == "approved"
+
+
 def test_older_observation_cannot_replace_newer_case_evidence(temp_storage):
     conn = temp_storage.connect()
 
@@ -243,12 +361,13 @@ def test_get_correction_patterns_ignores_review_cases_last_observation_id(temp_s
     after resolution. get_correction_patterns() must find the correction
     via classification_observations directly, never via review_cases."""
     obs1 = _obs(temp_storage, "g1", "dev1", "env", "environmental")
-    _label(temp_storage, obs1, "corrected", corrected_category="temperature_sensor")
     case_id = temp_storage.upsert_review_case("dev1", "env", "environmental", obs1)
-    temp_storage.resolve_review_case(
+    # Labels obs1 via the production dual-write (STEP 6.3: an observation
+    # can be labelled only once, so no separate _label() fixture here).
+    assert temp_storage.resolve_review_case(
         case_id, expected_observation_id=obs1, decision="corrected",
         corrected_category="temperature_sensor",
-    )
+    ) == "resolved"
 
     # A later, unlabelled observation for the same logical key arrives -
     # review_cases.last_observation_id now points away from obs1.

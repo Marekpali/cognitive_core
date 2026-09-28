@@ -130,6 +130,8 @@ def show_review_queue():
                       "arrived). Skipped - re-run review to see the current state.")
             elif result == 'not_found':
                 print("    ! Review case no longer exists. Skipped.")
+            elif result == 'already_resolved':
+                print("    ! Case was already resolved; original decision kept. Skipped.")
         elif choice == 'r':
             result = storage.resolve_review_case(
                 case['case_id'], expected_observation_id=case['observation_id'],
@@ -142,6 +144,8 @@ def show_review_queue():
                 print("    ⚠ This case changed since it was loaded. Skipped.")
             elif result == 'not_found':
                 print("    ! Review case no longer exists. Skipped.")
+            elif result == 'already_resolved':
+                print("    ! Case was already resolved; original decision kept. Skipped.")
         elif choice == 'c':
             print(f"    Known categories: {', '.join(sorted(KNOWN_CATEGORIES))}")
             corrected_category = input("    Correct category > ").strip()
@@ -162,6 +166,8 @@ def show_review_queue():
                     print("    ⚠ This case changed since it was loaded. Skipped.")
                 elif result == 'not_found':
                     print("    ! Review case no longer exists. Skipped.")
+                elif result == 'already_resolved':
+                    print("    ! Case was already resolved; original decision kept. Skipped.")
         elif choice == 's':
             print("    ~ Skipped")
 def show_review_count():

@@ -594,6 +594,14 @@ class Storage:
         UPDATE ... WHERE (case_id AND last_observation_id both matched),
         closing the race window entirely rather than narrowing it.
 
+        STEP 6.3: human decisions are immutable. Only a 'pending' case can
+        be resolved; a resolved case is refused ('already_resolved') and
+        its decision, corrected_category and decided_at stay untouched.
+        The dual-write likewise only labels an observation whose
+        human_decision is still NULL. Revising an earlier human decision,
+        if ever needed, must be a separate explicit operation that
+        preserves the original - never an in-place overwrite.
+
         decision is validated before any write. The review_cases UPDATE
         and the classification_observations dual-write are one logical
         operation via explicit try/except/rollback; the second UPDATE's
@@ -601,9 +609,10 @@ class Storage:
         the dual-write touched zero or more than one row.
 
         Returns:
-            'resolved'   - resolved successfully
-            'stale'      - last_observation_id had moved on; nothing written
-            'not_found'  - no such case_id
+            'resolved'         - resolved successfully
+            'already_resolved' - case was not pending; nothing written
+            'stale'            - last_observation_id had moved on; nothing written
+            'not_found'        - no such case_id
 
         Raises:
             ValueError: invalid decision, or corrected_category
@@ -638,15 +647,20 @@ class Storage:
                     corrected_category = ?,
                     decided_at = ?,
                     updated_at = ?
-                WHERE id = ? AND last_observation_id = ?
+                WHERE id = ? AND last_observation_id = ? AND status = 'pending'
             ''', (decision, corrected_category, now, now, case_id, expected_observation_id))
 
             if cursor.rowcount == 0:
                 conn.rollback()
-                cursor.execute('SELECT id FROM review_cases WHERE id = ?', (case_id,))
-                if cursor.fetchone() is None:
+                cursor.execute('SELECT status FROM review_cases WHERE id = ?', (case_id,))
+                row = cursor.fetchone()
+                if row is None:
                     print(f"[STORAGE] WARNING: resolve_review_case found no case for {case_id}")
                     return 'not_found'
+                if row['status'] != 'pending':
+                    print(f"[STORAGE] WARNING: resolve_review_case refused - {case_id} "
+                          f"is already {row['status']}; existing decision kept")
+                    return 'already_resolved'
                 print(f"[STORAGE] WARNING: resolve_review_case stale - {case_id} "
                       f"no longer points at {expected_observation_id}")
                 return 'stale'
@@ -659,7 +673,7 @@ class Storage:
                     review_reason = ?,
                     corrected_category = ?,
                     reviewed_by = ?
-                WHERE id = ?
+                WHERE id = ? AND human_decision IS NULL
             ''', (decision, now, reason, corrected_category, reviewed_by, expected_observation_id))
 
             if cursor.rowcount != 1:
