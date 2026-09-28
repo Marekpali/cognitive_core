@@ -18,6 +18,15 @@ class DecisionResult(str):
     string such as 'already_resolved' would otherwise be truthy, and an
     old `if storage.approve_observation(...):` caller would mistake a
     refused write for success.
+
+    Compatibility boundary: backward compatible with callers that use
+    truth-value testing (`if approve_observation(...):`, `not result`,
+    `bool(result)`). NOT compatible with callers that compare the return
+    value directly to a bool (`approve_observation(...) == True` is now
+    always False) - such callers must migrate to truth-value testing or
+    to comparing against 'resolved'. Equality with True/False is
+    deliberately not special-cased; that would make the type less
+    predictable.
     """
 
     def __bool__(self) -> bool:

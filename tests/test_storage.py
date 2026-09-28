@@ -545,3 +545,12 @@ def test_legacy_missing_observation_is_not_found_and_falsy(temp_storage, decisio
     result = _legacy_decide(temp_storage, "obs_does_not_exist", decision)
     assert result == "not_found"
     assert not result  # unchanged from the old `return False`
+
+
+def test_decision_result_truth_values():
+    from src.storage import DecisionResult
+    assert bool(DecisionResult("resolved")) is True
+    assert bool(DecisionResult("already_resolved")) is False
+    assert bool(DecisionResult("not_found")) is False
+    # Documented compatibility boundary: direct bool comparison is NOT supported.
+    assert (DecisionResult("resolved") == True) is False  # noqa: E712
