@@ -110,10 +110,6 @@ class CognitiveCore:
 
         print(f"[CORE] Asset saved: {asset_id}")
 
-        if hypothesis["confidence"] < 0.95:
-            self.storage.add_to_review_queue(asset_id)
-            print(f"[CORE] Added to review queue: {asset_id}")
-
     async def classify_device(self, device: Dict, source: str = "unknown") -> Optional[Dict]:
         best_hypothesis = None
         best_score = 0.0

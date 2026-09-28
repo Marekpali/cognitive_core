@@ -64,13 +64,13 @@ async def test_mock_device():
         test_device
     )
 
-    print("\n[CLI] Review Queue:")
-    reviews = core.storage.get_pending_asset_reviews()
-    for i, review in enumerate(reviews, 1):
+    print("\n[CLI] Pending Review Cases:")
+    cases = core.storage.get_pending_review_cases()
+    for i, case in enumerate(cases, 1):
         print(
-            f"[{i}] {review['name']} - "
-            f"{review['hypothesis_category']} "
-            f"({review['hypothesis_confidence']:.0%})"
+            f"[{i}] {case['device_name'] or case['device_id']} - "
+            f"{case['hypothesis_category']} "
+            f"({case['hypothesis_confidence']:.0%})"
         )
 
 # Known classifier output categories. Used to validate manual corrections
@@ -162,39 +162,6 @@ def show_review_queue():
                     print("    ⚠ This case changed since it was loaded. Skipped.")
                 elif result == 'not_found':
                     print("    ! Review case no longer exists. Skipped.")
-        elif choice == 's':
-            print("    ~ Skipped")
-def show_legacy_review_queue():
-    """CLI: Legacy review queue (STEP 1 architecture).
-
-    Operates on review_queue + assets via Storage.get_pending_asset_reviews().
-    Kept for backward compatibility. Not the primary workflow anymore -
-    use 'review' for the STEP 5 Human Review workflow instead.
-    """
-    storage = Storage()
-
-    print("\n[CLI] Pending Reviews (legacy):")
-    reviews = storage.get_pending_asset_reviews()
-
-    if not reviews:
-        print("[CLI] No pending reviews")
-        return
-
-    for i, review in enumerate(reviews, 1):
-        print(f"\n[{i}] {review['name']}")
-        print(f"    Category: {review['hypothesis_category']}")
-        print(f"    Confidence: {review['hypothesis_confidence']:.0%}")
-        print(f"    Reasoning: {review['hypothesis_reasoning']}")
-        print(f"    Review ID: {review['review_id']}")
-
-        choice = input("    [y]es / [n]o / [s]kip > ").lower()
-
-        if choice == 'y':
-            storage.approve_review(review['review_id'])
-            print("    ✓ Approved")
-        elif choice == 'n':
-            storage.reject_review(review['review_id'])
-            print("    ✗ Rejected")
         elif choice == 's':
             print("    ~ Skipped")
 def show_review_count():
@@ -302,8 +269,6 @@ if __name__ == '__main__':
 
         if command == 'review':
             show_review_queue()
-        elif command == 'legacy-review':
-            show_legacy_review_queue()
         elif command == 'review-count':
             show_review_count()
         elif command == 'review-stats':

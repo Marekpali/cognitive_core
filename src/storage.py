@@ -71,7 +71,10 @@ class Storage:
             )
         ''')
 
-        # Review queue table
+        # Legacy review queue table. Its runtime read/write path was retired
+        # after review_cases became the only active Human Review workflow.
+        # Keep the inert schema for one release cycle so historical rows are
+        # preserved until a dedicated migration removes the table.
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS review_queue (
                 id TEXT PRIMARY KEY,
@@ -383,103 +386,6 @@ class Storage:
         if row:
             return json.loads(row['device_data'])
         return None
-
-    def add_to_review_queue(self, asset_id: str) -> str:
-        """Add to review queue"""
-        from uuid import uuid4
-
-        conn = self.connect()
-        cursor = conn.cursor()
-
-        review_id = f"review_{uuid4().hex[:8]}"
-        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-        cursor.execute('''
-            INSERT INTO review_queue (id, asset_id, status, created_at)
-            VALUES (?, ?, ?, ?)
-        ''', (review_id, asset_id, 'pending', now))
-
-        conn.commit()
-        print(f"[STORAGE] Added to review queue: {review_id}")
-        return review_id
-
-    def get_pending_asset_reviews(self) -> List[Dict]:
-        """Get pending reviews from the legacy review_queue/assets flow.
-
-        LEGACY: This operates on review_queue + assets (STEP 1 architecture).
-        For the STEP 3 Learning Loop (classification_observations), use
-        get_pending_reviews() instead. For the STEP 5 Human Review
-        workflow, use get_pending_review_cases() instead.
-        """
-        conn = self.connect()
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            SELECT
-                r.id as review_id,
-                a.id as asset_id,
-                a.name,
-                a.hypothesis_category,
-                a.hypothesis_confidence,
-                a.hypothesis_reasoning
-            FROM review_queue r
-            JOIN assets a ON r.asset_id = a.id
-            WHERE r.status = 'pending'
-            ORDER BY r.created_at DESC
-        ''')
-
-        items = []
-        for row in cursor.fetchall():
-            items.append(dict(row))
-
-        return items
-
-    def approve_review(self, review_id: str) -> bool:
-        """Approve review"""
-        conn = self.connect()
-        cursor = conn.cursor()
-
-        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-        cursor.execute('''
-            UPDATE review_queue
-            SET status = 'approved', decision = 'approved', decided_at = ?
-            WHERE id = ?
-        ''', (now, review_id))
-
-        cursor.execute('''
-            SELECT asset_id FROM review_queue WHERE id = ?
-        ''', (review_id,))
-        row = cursor.fetchone()
-
-        if row:
-            asset_id = row['asset_id']
-            cursor.execute('''
-                UPDATE assets
-                SET lifecycle_state = 'confirmed', updated_at = ?
-                WHERE id = ?
-            ''', (now, asset_id))
-
-        conn.commit()
-        print(f"[STORAGE] Approved review: {review_id}")
-        return True
-
-    def reject_review(self, review_id: str) -> bool:
-        """Reject review"""
-        conn = self.connect()
-        cursor = conn.cursor()
-
-        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-        cursor.execute('''
-            UPDATE review_queue
-            SET status = 'rejected', decision = 'rejected', decided_at = ?
-            WHERE id = ?
-        ''', (now, review_id))
-
-        conn.commit()
-        print(f"[STORAGE] Rejected review: {review_id}")
-        return True
 
     def log_classification_observation(self, payload: Dict) -> Optional[str]:
         """Log a single classifier observation.

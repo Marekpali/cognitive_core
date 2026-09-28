@@ -53,42 +53,6 @@ def test_save_and_load_asset(temp_storage):
     assert loaded is not None
     assert loaded['name'] == 'Test Device'
 
-@pytest.mark.xfail(reason="Legacy review_queue test superseded by STEP 5 review_cases workflow", strict=True)
-def test_review_queue(temp_storage):
-    """Test review queue
-
-    NOTE (STEP 5): This test is pre-existing and already fails on the
-    current baseline (before any review_cases changes), because
-    get_pending_reviews() reads from classification_observations while
-    add_to_review_queue()/save_asset() write to review_queue/assets -
-    two unrelated tables since the STEP 3 rename. Left unmodified here
-    per the agreed scope: not fixed in this PR, tracked as a pre-existing
-    defect.
-    """
-
-    asset = {
-        'id': 'test_asset_2',
-        'name': 'Review Test',
-        'hypothesis': {
-            'category': 'energy_meter',
-            'confidence': 0.85
-        },
-        'lifecycle_state': 'provisional',
-        'lifecycle_discovered_at': datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    }
-
-    temp_storage.save_asset(asset)
-    review_id = temp_storage.add_to_review_queue('test_asset_2')
-
-    reviews = temp_storage.get_pending_reviews()
-    assert len(reviews) == 1
-
-    temp_storage.approve_review(review_id)
-
-    reviews = temp_storage.get_pending_reviews()
-    assert len(reviews) == 0
-
-
 # ---------------------------------------------------------------------------
 # STEP 5: review_cases tests
 # ---------------------------------------------------------------------------
