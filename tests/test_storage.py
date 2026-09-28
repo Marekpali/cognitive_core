@@ -239,7 +239,8 @@ def test_resolve_refuses_to_overwrite_already_labelled_observation(temp_storage)
     # methods) must not have that decision overwritten by the dual-write.
     obs = _obs(temp_storage, "g1", "dev1", "env", "environmental")
     case_id = temp_storage.upsert_review_case("dev1", "env", "environmental", obs)
-    temp_storage.approve_observation(obs)
+    with pytest.warns(DeprecationWarning):
+        assert temp_storage.approve_observation(obs) == "resolved"
 
     with pytest.raises(RuntimeError):
         temp_storage.resolve_review_case(
@@ -469,3 +470,78 @@ def test_backfill_reconstructs_state_without_reopening(temp_storage):
     assert result["created"] == 1
 
     assert temp_storage.count_pending_reviews() == 0  # resolved, not reopened by a2
+
+
+# ---------------------------------------------------------------------------
+# STEP 6.4: legacy observation-level decision methods are immutable too
+# ---------------------------------------------------------------------------
+
+_DECISION_FIELDS = (
+    "review_status, human_decision, corrected_category, "
+    "reviewed_at, review_reason, reviewed_by"
+)
+
+
+def _obs_decision(temp_storage, obs_id):
+    row = temp_storage.connect().execute(
+        f"SELECT {_DECISION_FIELDS} FROM classification_observations WHERE id = ?",
+        (obs_id,),
+    ).fetchone()
+    return dict(row)
+
+
+def _legacy_decide(temp_storage, obs_id, decision):
+    """Call the legacy method for decision ('approved'|'rejected'|'corrected')."""
+    with pytest.warns(DeprecationWarning):
+        if decision == "approved":
+            return temp_storage.approve_observation(obs_id, reason="first")
+        if decision == "rejected":
+            return temp_storage.reject_observation(obs_id, reason="first")
+        return temp_storage.correct_observation(obs_id, "occupancy", reason="first")
+
+
+@pytest.mark.parametrize("decision", ["approved", "rejected", "corrected"])
+def test_legacy_first_decision_succeeds(temp_storage, decision):
+    obs = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    result = _legacy_decide(temp_storage, obs, decision)
+    assert result == "resolved"
+    assert result  # truthy on success, as the old bool contract was
+    state = _obs_decision(temp_storage, obs)
+    assert state["human_decision"] == decision
+    assert state["review_status"] == "reviewed"
+    assert state["corrected_category"] == ("occupancy" if decision == "corrected" else None)
+
+
+@pytest.mark.parametrize("first, second", [
+    ("approved", "corrected"),
+    ("corrected", "approved"),
+    ("rejected", "approved"),
+])
+def test_legacy_second_decision_is_refused_and_changes_nothing(temp_storage, first, second):
+    obs = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    _legacy_decide(temp_storage, obs, first)
+    before = _obs_decision(temp_storage, obs)
+
+    result = _legacy_decide(temp_storage, obs, second)
+
+    assert result == "already_resolved"
+    assert not result  # an old `if storage.approve_observation(...)` sees failure
+    # every decision field and timestamp unchanged
+    assert _obs_decision(temp_storage, obs) == before
+
+
+def test_legacy_cannot_overwrite_decision_made_by_resolve_review_case(temp_storage):
+    case_id, obs = _resolved_case(temp_storage, "approved")
+    before = _obs_decision(temp_storage, obs)
+
+    result = _legacy_decide(temp_storage, obs, "corrected")
+
+    assert result == "already_resolved"
+    assert _obs_decision(temp_storage, obs) == before
+
+
+@pytest.mark.parametrize("decision", ["approved", "rejected", "corrected"])
+def test_legacy_missing_observation_is_not_found_and_falsy(temp_storage, decision):
+    result = _legacy_decide(temp_storage, "obs_does_not_exist", decision)
+    assert result == "not_found"
+    assert not result  # unchanged from the old `return False`

@@ -6,6 +6,22 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Optional, List
 import json
+import warnings
+
+
+class DecisionResult(str):
+    """Outcome of a legacy observation-level decision (STEP 6.4).
+
+    Compares like the plain strings resolve_review_case() returns
+    ('resolved', 'already_resolved', 'not_found'), but is truthy ONLY for
+    'resolved'. The legacy methods used to return a bool; a non-empty
+    string such as 'already_resolved' would otherwise be truthy, and an
+    old `if storage.approve_observation(...):` caller would mistake a
+    refused write for success.
+    """
+
+    def __bool__(self) -> bool:
+        return self == "resolved"
 
 class Storage:
     """SQLite-based operational data storage"""
@@ -1272,102 +1288,53 @@ class Storage:
             for row in rows
         ]
 
+    # -- Legacy observation-level decisions ---------------------------------
+    #
+    # LEGACY / DEPRECATED (STEP 5, hardened in STEP 6.4): superseded by
+    # resolve_review_case() for the Human Review workflow. No caller in
+    # src/ uses them; they are kept only because a manual script outside
+    # the repository might. Like resolve_review_case() (STEP 6.3), they
+    # never overwrite an existing human decision: only an observation with
+    # human_decision IS NULL can be decided, a second decision is refused
+    # as 'already_resolved' and leaves every decision field unchanged.
+    # Returned DecisionResult truthiness matches the previous bool contract.
+
     def approve_observation(
         self,
         observation_id: str,
         reason: Optional[str] = None,
         reviewed_by: str = "human",
-    ) -> bool:
-        """Mark an observation as approved (classifier was correct).
-
-        STEP 3C: Human decision - approve.
-
-        LEGACY (STEP 5): Superseded by resolve_review_case() for the
-        primary Human Review workflow. Retained for any external callers
-        and for get_review_analytics() consistency.
-
-        Args:
-            observation_id: the classification_observations.id to update
-            reason: optional free-text note from the reviewer
-            reviewed_by: who made the decision (default 'human')
+    ) -> DecisionResult:
+        """DEPRECATED: mark an observation as approved (classifier was
+        correct). Use resolve_review_case() instead.
 
         Returns:
-            True if a row was updated, False if the observation_id
-            was not found (in which case nothing is committed).
+            DecisionResult - 'resolved' (truthy), or 'already_resolved' /
+            'not_found' (both falsy, nothing written).
         """
-        conn = self.connect()
-        cursor = conn.cursor()
-
-        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-        cursor.execute('''
-            UPDATE classification_observations
-            SET
-                review_status = 'reviewed',
-                human_decision = 'approved',
-                reviewed_at = ?,
-                review_reason = ?,
-                reviewed_by = ?
-            WHERE id = ?
-        ''', (now, reason, reviewed_by, observation_id))
-
-        if cursor.rowcount == 0:
-            conn.rollback()
-            print(f"[STORAGE] WARNING: approve_observation found no row for {observation_id}")
-            return False
-
-        conn.commit()
-        print(f"[STORAGE] Observation approved: {observation_id}")
-        return True
+        return self._record_legacy_decision(
+            "approve_observation", observation_id, "approved",
+            None, reason, reviewed_by,
+        )
 
     def reject_observation(
         self,
         observation_id: str,
         reason: Optional[str] = None,
         reviewed_by: str = "human",
-    ) -> bool:
-        """Mark an observation as rejected (classifier was wrong,
-        no correct category supplied).
-
-        STEP 3C: Human decision - reject.
-
-        LEGACY (STEP 5): Superseded by resolve_review_case() for the
-        primary Human Review workflow. Retained for any external callers
-        and for get_review_analytics() consistency.
-
-        Args:
-            observation_id: the classification_observations.id to update
-            reason: optional free-text note from the reviewer
-            reviewed_by: who made the decision (default 'human')
+    ) -> DecisionResult:
+        """DEPRECATED: mark an observation as rejected (classifier was
+        wrong, no correct category supplied). Use resolve_review_case()
+        instead.
 
         Returns:
-            True if a row was updated, False if the observation_id
-            was not found (in which case nothing is committed).
+            DecisionResult - 'resolved' (truthy), or 'already_resolved' /
+            'not_found' (both falsy, nothing written).
         """
-        conn = self.connect()
-        cursor = conn.cursor()
-
-        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-        cursor.execute('''
-            UPDATE classification_observations
-            SET
-                review_status = 'reviewed',
-                human_decision = 'rejected',
-                reviewed_at = ?,
-                review_reason = ?,
-                reviewed_by = ?
-            WHERE id = ?
-        ''', (now, reason, reviewed_by, observation_id))
-
-        if cursor.rowcount == 0:
-            conn.rollback()
-            print(f"[STORAGE] WARNING: reject_observation found no row for {observation_id}")
-            return False
-
-        conn.commit()
-        print(f"[STORAGE] Observation rejected: {observation_id}")
-        return True
+        return self._record_legacy_decision(
+            "reject_observation", observation_id, "rejected",
+            None, reason, reviewed_by,
+        )
 
     def correct_observation(
         self,
@@ -1375,57 +1342,71 @@ class Storage:
         corrected_category: str,
         reason: Optional[str] = None,
         reviewed_by: str = "human",
-    ) -> bool:
-        """Mark an observation as corrected: classifier was wrong,
-        and the human supplies the correct category.
+    ) -> DecisionResult:
+        """DEPRECATED: mark an observation as corrected - classifier was
+        wrong and the human supplies the correct category. Use
+        resolve_review_case() instead.
 
-        STEP 3C: Human decision - correct.
-
-        LEGACY (STEP 5): Superseded by resolve_review_case() for the
-        primary Human Review workflow. Retained for any external callers
-        and for get_review_analytics() consistency.
-
-        The original hypothesis_category is preserved as-is (it stays
-        the classifier's actual guess). corrected_category stores the
-        human-supplied correct answer separately, so future accuracy
-        tracking can compare "what the classifier said" against "what
-        was actually true" without losing either value.
-
-        Args:
-            observation_id: the classification_observations.id to update
-            corrected_category: the human-supplied correct category
-            reason: optional free-text note from the reviewer
-            reviewed_by: who made the decision (default 'human')
+        The original hypothesis_category is preserved as-is;
+        corrected_category stores the human-supplied answer separately.
 
         Returns:
-            True if a row was updated, False if the observation_id
-            was not found (in which case nothing is committed).
+            DecisionResult - 'resolved' (truthy), or 'already_resolved' /
+            'not_found' (both falsy, nothing written).
         """
+        return self._record_legacy_decision(
+            "correct_observation", observation_id, "corrected",
+            corrected_category, reason, reviewed_by,
+        )
+
+    def _record_legacy_decision(
+        self,
+        method: str,
+        observation_id: str,
+        decision: str,
+        corrected_category: Optional[str],
+        reason: Optional[str],
+        reviewed_by: str,
+    ) -> DecisionResult:
+        """Shared write path for the three legacy decision methods."""
+        warnings.warn(
+            f"Storage.{method}() is deprecated; use resolve_review_case()",
+            DeprecationWarning,
+            stacklevel=3,
+        )
         conn = self.connect()
         cursor = conn.cursor()
-
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         cursor.execute('''
             UPDATE classification_observations
             SET
                 review_status = 'reviewed',
-                human_decision = 'corrected',
+                human_decision = ?,
                 corrected_category = ?,
                 reviewed_at = ?,
                 review_reason = ?,
                 reviewed_by = ?
-            WHERE id = ?
-        ''', (corrected_category, now, reason, reviewed_by, observation_id))
+            WHERE id = ? AND human_decision IS NULL
+        ''', (decision, corrected_category, now, reason, reviewed_by, observation_id))
 
         if cursor.rowcount == 0:
             conn.rollback()
-            print(f"[STORAGE] WARNING: correct_observation found no row for {observation_id}")
-            return False
+            cursor.execute(
+                "SELECT human_decision FROM classification_observations WHERE id = ?",
+                (observation_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                print(f"[STORAGE] WARNING: {method} found no row for {observation_id}")
+                return DecisionResult("not_found")
+            print(f"[STORAGE] WARNING: {method} refused - {observation_id} already "
+                  f"has human_decision={row['human_decision']!r}; existing decision kept")
+            return DecisionResult("already_resolved")
 
         conn.commit()
-        print(f"[STORAGE] Observation corrected: {observation_id} -> {corrected_category}")
-        return True
+        print(f"[STORAGE] Observation {decision}: {observation_id}")
+        return DecisionResult("resolved")
 
     def insert_environmental_reading(self, asset_id: str, data: Dict) -> int:
         """Insert environmental sensor reading"""
