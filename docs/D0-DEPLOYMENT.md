@@ -254,3 +254,15 @@ Open items carried forward:
    events still reach Cognitive Core.
 3. Old files in the HAOS share root (`storage.py`, `core.py`, `main.py`
    from STEP 1/2 and others) — tidy up to avoid copy mistakes.
+
+---
+
+## Erratum (2026-09-29)
+
+The finding "the second STEP 5 case was resolved on 2026-08-08 between
+10:17 and 22:19" is more precise than stated: the `/data/core.db` mtime of
+2026-08-08 22:19 CEST **is** that resolution — `case_a35cab51.decided_at`
+= 2026-08-08T20:19:43.895131Z. The "no device event for seven weeks"
+observation was investigated in `docs/PIPELINE-CHECK.md`: expected
+behaviour (only device registry changes trigger observations), pipeline
+verified working.
