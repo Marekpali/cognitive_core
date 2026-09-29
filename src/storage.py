@@ -9,6 +9,27 @@ import json
 import warnings
 
 
+# M1 (docs/STEP7_ARCHITECTURE.md): the raw classifier observation is
+# immutable once inserted. One trigger per column so the abort message can
+# name the exact column (SQLite RAISE() only accepts a literal message).
+# Review/workflow columns (review_status, human_decision, corrected_category,
+# reviewed_at, review_reason, reviewed_by) are deliberately NOT listed.
+RAW_HYPOTHESIS_COLUMNS = (
+    "observation_group_id",
+    "device_id",
+    "classifier_name",
+    "hypothesis_category",
+    "hypothesis_confidence",
+    "hypothesis_reasoning",
+    "device_name",
+    "device_model",
+    "device_manufacturer",
+    "device_source_adapter",
+    "device_entity_count",
+    "created_at",
+)
+
+
 class DecisionResult(str):
     """Outcome of a legacy observation-level decision (STEP 6.4).
 
@@ -149,6 +170,9 @@ class Storage:
         # NEW: Classification observations table (STEP 1)
         self.init_classification_observations_schema(cursor)
 
+        # M1: raw hypothesis immutability triggers (idempotent)
+        self._ensure_raw_hypothesis_immutability(cursor)
+
         # STEP 3: Ensure review columns exist (idempotent migration)
         self._ensure_review_columns(conn)
 
@@ -219,6 +243,30 @@ class Storage:
 
         print("[STORAGE] Indices created/verified (2 indices)")
         print("[STORAGE] classification_observations schema initialization complete - OK")
+
+    def _ensure_raw_hypothesis_immutability(self, cursor) -> None:
+        """M1: abort any UPDATE that CHANGES a raw classifier field.
+
+        Value-change semantics: `WHEN OLD.col IS NOT NEW.col` (NULL-safe),
+        so re-assigning the same value (`SET col = col`) is allowed and only
+        a real change is refused. Creating the triggers reads and writes no
+        row data. CREATE TRIGGER IF NOT EXISTS makes this idempotent; a
+        future change to the trigger body needs a new trigger name.
+
+        Not covered by design: DELETE of observation rows, and INSERT
+        (new observations are the normal write path).
+        """
+        for column in RAW_HYPOTHESIS_COLUMNS:
+            cursor.execute(f'''
+                CREATE TRIGGER IF NOT EXISTS trg_obs_immutable_{column}
+                BEFORE UPDATE OF {column} ON classification_observations
+                WHEN OLD.{column} IS NOT NEW.{column}
+                BEGIN
+                    SELECT RAISE(ABORT, 'IMMUTABLE_RAW_HYPOTHESIS: classification_observations.{column} cannot be changed after insert');
+                END
+            ''')
+        print(f"[STORAGE] Raw hypothesis immutability triggers verified "
+              f"({len(RAW_HYPOTHESIS_COLUMNS)} columns)")
 
     def init_review_cases_schema(self, cursor):
         """Create review_cases table.

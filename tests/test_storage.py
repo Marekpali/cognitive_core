@@ -68,6 +68,21 @@ def _obs(temp_storage, group, device_id, classifier_name, category,
     })
 
 
+def _obs_at(temp_storage, obs_id, device_id, classifier_name, category, created_at):
+    """Insert an observation with an explicit created_at (test fixture)."""
+    conn = temp_storage.connect()
+    conn.execute(
+        "INSERT INTO classification_observations (id, observation_group_id, "
+        "device_id, classifier_name, hypothesis_category, hypothesis_confidence, "
+        "hypothesis_reasoning, device_name, device_model, device_manufacturer, "
+        "device_source_adapter, device_entity_count, created_at) "
+        "VALUES (?, ?, ?, ?, ?, 0.8, '', 'D1', '', '', 'ha', 1, ?)",
+        (obs_id, f"g_{obs_id}", device_id, classifier_name, category, created_at),
+    )
+    conn.commit()
+    return obs_id
+
+
 def test_upsert_review_case_creates_pending(temp_storage):
     obs_id = _obs(temp_storage, "g1", "dev1", "motion_sensor", "motion")
     temp_storage.upsert_review_case("dev1", "motion_sensor", "motion", obs_id)
@@ -255,19 +270,12 @@ def test_resolve_refuses_to_overwrite_already_labelled_observation(temp_storage)
 def test_older_observation_cannot_replace_newer_case_evidence(temp_storage):
     conn = temp_storage.connect()
 
-    o1 = _obs(temp_storage, "g1", "dev1", "motion_sensor", "motion")
-    conn.execute(
-        "UPDATE classification_observations SET created_at = ? WHERE id = ?",
-        ("2026-08-01T00:00:00Z", o1),
-    )
-    conn.commit()
-
-    o2 = _obs(temp_storage, "g2", "dev1", "motion_sensor", "motion")
-    conn.execute(
-        "UPDATE classification_observations SET created_at = ? WHERE id = ?",
-        ("2026-08-02T00:00:00Z", o2),
-    )
-    conn.commit()
+    # Rows with controlled created_at are INSERTed directly: since M1 the
+    # raw created_at of an existing observation cannot be rewritten.
+    o1 = _obs_at(temp_storage, "o1", "dev1", "motion_sensor", "motion",
+                 "2026-08-01T00:00:00Z")
+    o2 = _obs_at(temp_storage, "o2", "dev1", "motion_sensor", "motion",
+                 "2026-08-02T00:00:00Z")
 
     # Upsert the NEWER observation first, then the OLDER one arrives late
     # (out-of-order commit) - the case must not regress to o1.

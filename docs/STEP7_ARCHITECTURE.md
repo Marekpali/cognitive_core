@@ -132,9 +132,14 @@ annotation layer enabled vs. disabled:
   **The row is not frozen.** Workflow/review columns (`review_status`,
   `human_decision`, `corrected_category`, `reviewed_at`, `review_reason`,
   `reviewed_by`) remain writable — `resolve_review_case()` dual-write is
-  unaffected. The trigger fires whenever a raw column appears in an
-  `UPDATE ... SET`, even with an unchanged value; no current code path
-  does that (verified 2026-09-28 against all four `UPDATE
+  unaffected. **As implemented in M1 (2026-09-29):** value-change
+  semantics — one trigger per column, `BEFORE UPDATE OF <col> ... WHEN
+  OLD.<col> IS NOT NEW.<col>` (NULL-safe), so re-assigning the same value
+  (`SET col = col`) is allowed and only a real change is aborted, with
+  `IMMUTABLE_RAW_HYPOTHESIS: classification_observations.<col> cannot be
+  changed after insert` (`sqlite3.IntegrityError`). One trigger per column
+  because SQLite `RAISE()` accepts only a literal message. No code path
+  updates raw columns (verified against all `UPDATE
   classification_observations` statements in `src/storage.py`).
 - `precedent_annotations` and `precedent_annotation_evidence`:
   append-only; `BEFORE UPDATE` and `BEFORE DELETE` triggers abort.

@@ -55,7 +55,8 @@ def test_clean_database_passes_and_is_not_modified(db_dir):
     assert "[INFO] review_cases pending: 1" in result.stdout
     assert "[INFO] review_cases resolved: 1" in result.stdout
     assert "[INFO] observations carrying a human decision: 1" in result.stdout
-    assert "[INFO] SQLite triggers: 0" in result.stdout
+    # Storage now creates the 12 M1 triggers; the precheck lists them (INFO).
+    assert "[INFO] SQLite triggers: 12 (trg_obs_immutable_classifier_name" in result.stdout
     assert "script SHA256:" in result.stdout and "database size:" in result.stdout
     assert DEVICE_NAME not in result.stdout
     assert (db_dir / "clean.db").read_bytes() == before
