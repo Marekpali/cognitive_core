@@ -141,6 +141,12 @@ annotation layer enabled vs. disabled:
   because SQLite `RAISE()` accepts only a literal message. No code path
   updates raw columns (verified against all `UPDATE
   classification_observations` statements in `src/storage.py`).
+- `classification_observations.id`: protected by a separate trigger,
+  `trg_obs_immutable_id` (`IMMUTABLE_OBSERVATION_IDENTITY: ...`), same
+  value-change semantics. Kept out of the raw-hypothesis list on purpose:
+  record identity immutable, raw hypothesis immutable, review metadata
+  mutable. Changing an id would orphan `review_cases.last_observation_id`
+  and precedent annotation references.
 - `precedent_annotations` and `precedent_annotation_evidence`:
   append-only; `BEFORE UPDATE` and `BEFORE DELETE` triggers abort.
 

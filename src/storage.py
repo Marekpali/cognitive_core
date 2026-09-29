@@ -30,6 +30,11 @@ RAW_HYPOTHESIS_COLUMNS = (
 )
 
 
+# M1: record identity is protected separately from the raw hypothesis -
+# `id` is not classifier output. Model: record identity immutable, raw
+# hypothesis immutable, review metadata mutable.
+OBSERVATION_IDENTITY_TRIGGER = "trg_obs_immutable_id"
+
 class DecisionResult(str):
     """Outcome of a legacy observation-level decision (STEP 6.4).
 
@@ -173,6 +178,9 @@ class Storage:
         # M1: raw hypothesis immutability triggers (idempotent)
         self._ensure_raw_hypothesis_immutability(cursor)
 
+        # M1: observation identity immutability trigger (idempotent)
+        self._ensure_observation_identity_immutability(cursor)
+
         # STEP 3: Ensure review columns exist (idempotent migration)
         self._ensure_review_columns(conn)
 
@@ -267,6 +275,24 @@ class Storage:
             ''')
         print(f"[STORAGE] Raw hypothesis immutability triggers verified "
               f"({len(RAW_HYPOTHESIS_COLUMNS)} columns)")
+
+    def _ensure_observation_identity_immutability(self, cursor) -> None:
+        """M1: abort any UPDATE that changes classification_observations.id.
+
+        The id is referenced by review_cases.last_observation_id (and, from
+        STEP 7a, by precedent annotations); changing it would orphan those
+        references. Same value-change semantics as the raw hypothesis
+        triggers: `SET id = id` is allowed.
+        """
+        cursor.execute(f'''
+            CREATE TRIGGER IF NOT EXISTS {OBSERVATION_IDENTITY_TRIGGER}
+            BEFORE UPDATE OF id ON classification_observations
+            WHEN OLD.id IS NOT NEW.id
+            BEGIN
+                SELECT RAISE(ABORT, 'IMMUTABLE_OBSERVATION_IDENTITY: classification_observations.id cannot be changed after insert');
+            END
+        ''')
+        print("[STORAGE] Observation identity immutability trigger verified")
 
     def init_review_cases_schema(self, cursor):
         """Create review_cases table.

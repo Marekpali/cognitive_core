@@ -53,6 +53,13 @@ def _row(storage, obs_id):
 
 
 def _triggers(storage):
+    """Raw-hypothesis triggers only (the identity trigger is tested separately)."""
+    raw = {f"trg_obs_immutable_{c}" for c in RAW_HYPOTHESIS_COLUMNS}
+    return sorted(r[0] for r in storage.connect().execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger'") if r[0] in raw)
+
+
+def _all_triggers(storage):
     return sorted(r[0] for r in storage.connect().execute(
         "SELECT name FROM sqlite_master WHERE type = 'trigger'"))
 
@@ -185,7 +192,7 @@ def test_adding_triggers_to_existing_database_changes_no_data():
         s = Storage(path)
         _obs(s, "g1", "dev1", "env", "environmental")
         _resolved_case(s, "approved")
-        for name in _triggers(s):
+        for name in _all_triggers(s):
             s.connect().execute(f"DROP TRIGGER {name}")
         s.connect().commit()
         before = [line for line in s.connect().iterdump()
@@ -195,8 +202,10 @@ def test_adding_triggers_to_existing_database_changes_no_data():
         upgraded = Storage(path)  # startup on the pre-M1 database
         after = [line for line in upgraded.connect().iterdump()
                  if line.startswith("INSERT")]
-        triggers = _triggers(upgraded)
+        raw_triggers = _triggers(upgraded)
+        all_triggers = _all_triggers(upgraded)
         upgraded.connection.close()
 
     assert after == before
-    assert len(triggers) == 12
+    assert len(raw_triggers) == 12
+    assert all_triggers == sorted(raw_triggers + ["trg_obs_immutable_id"])
