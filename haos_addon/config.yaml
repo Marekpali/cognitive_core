@@ -1,0 +1,15 @@
+name: "Cognitive Core"
+description: "Home automation intelligence with classification observation logging"
+version: "0.2.0"
+slug: "cognitive_core"
+arch:
+  - amd64
+startup: application
+boot: auto
+init: false
+stage: experimental
+homeassistant_api: true
+map:
+  - type: share
+    read_only: true
+schema: false
