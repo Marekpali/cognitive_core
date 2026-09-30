@@ -12,4 +12,7 @@ homeassistant_api: true
 map:
   - type: share
     read_only: true
-schema: false
+options:
+  observation_mode: shadow
+schema:
+  observation_mode: list(shadow|active)
