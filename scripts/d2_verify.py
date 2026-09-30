@@ -21,6 +21,8 @@ only for missing STEP 7P elements.
   DATA      every pre_d2.db row is still present and identical (pre-D2
             columns); pre-D2 observations keep input_id NULL; review_cases
             may only advance last_observation_id/updated_at to new evidence.
+  PINS      every package pinned in the deployed requirements.txt is
+            installed at exactly that version.
   SHADOW    no classification_inputs, no new observations, review cases or
             assets since the snapshot; every sweep row is mode 'shadow'.
 
@@ -30,6 +32,8 @@ copies in /tmp. Prints ids, counts and hashes only. Exit 0 = all PASS.
 
 import argparse
 import hashlib
+import importlib.metadata
+import re
 import sqlite3
 import sys
 import warnings
@@ -57,6 +61,25 @@ DEPLOYED_FILES = (
     "adapters/ha.py", "classifiers/__init__.py",
 )
 SHADOW_COUNTS = ("classification_observations", "review_cases", "assets")
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def check_pins(requirements: Path) -> list:
+    if not requirements.exists():
+        return [f"requirements file not found: {requirements}"]
+    installed = {_norm(d.metadata["Name"]): d.version
+                 for d in importlib.metadata.distributions()}
+    pins = [line.strip().split("==") for line in
+            requirements.read_text(encoding="utf-8").splitlines()
+            if "==" in line and not line.lstrip().startswith("#")]
+    failures = [f"{name}: installed {installed.get(_norm(name), 'absent')}, pinned {version}"
+                for name, version in pins if installed.get(_norm(name)) != version]
+    print(f"  pinned packages installed at the pinned version: "
+          f"{len(pins) - len(failures)}/{len(pins)}")
+    return failures or ([] if pins else ["no pinned packages found"])
 
 
 def sha256(path: Path) -> str:
@@ -297,6 +320,7 @@ def main() -> int:
     parser.add_argument("--live-db", default="/data/core.db")
     parser.add_argument("--pre-db", default="/tmp/pre_d2.db")
     parser.add_argument("--work-dir", default="/tmp")
+    parser.add_argument("--requirements", default="/share/d2/requirements.txt")
     args = parser.parse_args()
     src_root, work_dir = Path(args.src_root), Path(args.work_dir)
     pre_p = Path(args.pre_db)
@@ -312,6 +336,7 @@ def main() -> int:
         ("D0", lambda: check_d0(live, work_dir / "d2_verify_d0.db", src_root)),
         ("D1", lambda: check_d1(live, work_dir / "d2_verify_d1.db")),
         ("D2", lambda: check_d2(live, work_dir / "d2_verify_d2.db")),
+        ("PINS", lambda: check_pins(Path(args.requirements))),
         ("DATA", lambda: check_data(pre, live)),
         ("SHADOW", lambda: check_shadow(pre, live)),
     ]

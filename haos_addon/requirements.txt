@@ -1,7 +1,24 @@
 # Cognitive Core - Home Assistant App
-# STEP 2: Classification Observation Logging
+# Fully pinned for reproducible rebuilds (D2). Resolved with:
+#   uv pip compile --python-version 3.11 --python-platform x86_64-unknown-linux-gnu
+# from: aiohttp==3.14.3, websockets, python-dateutil, requests.
+# The suite (213 tests, incl. a real aiohttp WebSocket server test) passes
+# on Python 3.11 with exactly these versions. Change only with a re-run.
 
-aiohttp>=3.8.0
-websockets>=10.0
-python-dateutil>=2.8.0
-requests>=2.28.0
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+attrs==26.1.0
+certifi==2026.7.22
+charset-normalizer==3.5.2
+frozenlist==1.8.0
+idna==3.20
+multidict==6.9.1
+propcache==0.5.4
+python-dateutil==2.9.0.post0
+requests==2.34.2
+six==1.17.0
+typing-extensions==4.16.0
+urllib3==2.8.0
+websockets==17.1
+yarl==1.25.1

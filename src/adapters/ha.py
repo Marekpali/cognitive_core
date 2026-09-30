@@ -16,6 +16,7 @@ SnapshotCallback = Callable[[str, list, list, list], Awaitable[Optional[int]]]
 # connection: the partially read response stream cannot be trusted, so the
 # adapter reconnects instead of continuing on the same socket.
 SNAPSHOT_TIMEOUT_SECONDS = 60.0
+RECONNECT_DELAY_SECONDS = 5.0
 
 
 class HAAdapter:
@@ -74,7 +75,7 @@ class HAAdapter:
 
             except Exception as exc:
                 print(f"[HA] Connection error: {exc}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
     async def _serve(self, ws):
         """Alternate between due sweeps and incoming messages until closed."""

@@ -49,18 +49,27 @@ def dbs():
         yield tmp
 
 
-def _run(tmp: Path, live="live.db", src_root=REPO) -> subprocess.CompletedProcess:
+def _pins(tmp: Path, lines) -> Path:
+    path = tmp / "requirements.txt"
+    path.write_text("\n".join(["# comment", *lines]) + "\n", encoding="utf-8")
+    return path
+
+
+def _run(tmp: Path, live="live.db", src_root=REPO, requirements=None) -> subprocess.CompletedProcess:
+    import importlib.metadata
+    requirements = requirements or _pins(tmp, [
+        f"pytest=={importlib.metadata.version('pytest')}"])
     return subprocess.run(
         [sys.executable, str(SCRIPT), "--src-root", str(src_root),
          "--live-db", str(tmp / live), "--pre-db", str(tmp / "pre.db"),
-         "--work-dir", str(tmp / "work")],
+         "--work-dir", str(tmp / "work"), "--requirements", str(requirements)],
         capture_output=True, text=True,
     )
 
 
 def _sections(stdout: str) -> dict:
     return {line.split()[0]: line.split()[1] for line in stdout.splitlines()
-            if line.split()[:1] and line.split()[0] in ("D0", "D1", "D2", "DATA", "SHADOW")
+            if line.split()[:1] and line.split()[0] in ("D0", "D1", "D2", "PINS", "DATA", "SHADOW")
             and len(line.split()) == 2}
 
 
@@ -83,7 +92,7 @@ def test_pass_all_sections_and_live_db_untouched(dbs):
     result = _run(dbs)
     assert result.returncode == 0, result.stdout + result.stderr
     assert _sections(result.stdout) == dict.fromkeys(
-        ("D0", "D1", "D2", "DATA", "SHADOW"), "PASS")
+        ("D0", "D1", "D2", "PINS", "DATA", "SHADOW"), "PASS")
     for expected in ("resolved cases re-decided on a copy: 1",
                      "D1 triggers present: 13/13",
                      "D1 protected changes refused with exact message: 13/13",
@@ -102,7 +111,7 @@ def test_negative_control_fails_only_in_d2(dbs):
     result = _run(dbs, live="pre.db")
     assert result.returncode == 1
     assert _sections(result.stdout) == {"D0": "PASS", "D1": "PASS", "D2": "FAIL",
-                                        "DATA": "PASS", "SHADOW": "PASS"}
+                                        "PINS": "PASS", "DATA": "PASS", "SHADOW": "PASS"}
     assert "missing trigger trg_obs_immutable_input_id" in result.stdout
     assert "missing table classification_inputs" in result.stdout
 
@@ -206,3 +215,15 @@ def test_backfilled_input_id_on_pre_d2_row_fails(dbs):
     result = _run(dbs)
     assert result.returncode == 1
     assert "pre-D2 observation(s) gained an input_id" in result.stdout
+
+
+def test_version_drift_fails_pins(dbs):
+    result = _run(dbs, requirements=_pins(dbs, ["pytest==0.0.1", "not-installed-pkg==1.0"]))
+    assert _sections(result.stdout)["PINS"] == "FAIL"
+    assert "pytest: installed" in result.stdout and "pinned 0.0.1" in result.stdout
+    assert "not-installed-pkg: installed absent" in result.stdout
+
+
+def test_missing_requirements_file_fails_pins(dbs):
+    result = _run(dbs, requirements=dbs / "nope.txt")
+    assert _sections(result.stdout)["PINS"] == "FAIL"

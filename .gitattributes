@@ -1,1 +1,2 @@
 haos_addon/** text eol=lf
+tests/legacy/** -text
