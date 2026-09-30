@@ -8,6 +8,8 @@ from typing import Dict, Optional, List
 import json
 import warnings
 
+from src import coverage_store
+
 
 # M1 (docs/STEP7_ARCHITECTURE.md): the raw classifier observation is
 # immutable once inserted. One trigger per column so the abort message can
@@ -181,6 +183,9 @@ class Storage:
         # M1: observation identity immutability trigger (idempotent)
         self._ensure_observation_identity_immutability(cursor)
 
+        # STEP 7P: classifier inputs, sweep records, input_id link
+        self.init_step7p_schema(cursor)
+
         # STEP 3: Ensure review columns exist (idempotent migration)
         self._ensure_review_columns(conn)
 
@@ -293,6 +298,13 @@ class Storage:
             END
         ''')
         print("[STORAGE] Observation identity immutability trigger verified")
+
+    def init_step7p_schema(self, cursor) -> None:
+        """STEP 7P tables, input_id column and their triggers (idempotent).
+
+        Separate method so tests can reconstruct a D1-era database.
+        """
+        coverage_store.ensure_schema(cursor)
 
     def init_review_cases_schema(self, cursor):
         """Create review_cases table.
@@ -515,47 +527,12 @@ class Storage:
             - Errors are logged but don't stop asset creation
             - Confidence is stored as-is (0.0-1.0), displayed as percentage
         """
-        from uuid import uuid4
-
         conn = self.connect()
         cursor = conn.cursor()
-
-        observation_id = f"obs_{uuid4().hex[:12]}"
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         try:
-            cursor.execute('''
-                INSERT INTO classification_observations (
-                    id,
-                    observation_group_id,
-                    device_id,
-                    classifier_name,
-                    hypothesis_category,
-                    hypothesis_confidence,
-                    hypothesis_reasoning,
-                    device_name,
-                    device_model,
-                    device_manufacturer,
-                    device_source_adapter,
-                    device_entity_count,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                observation_id,
-                payload["observation_group_id"],
-                payload["device_id"],
-                payload["classifier_name"],
-                payload["hypothesis_category"],
-                payload["hypothesis_confidence"],
-                payload["hypothesis_reasoning"],
-                payload["device_name"],
-                payload["device_model"],
-                payload["device_manufacturer"],
-                payload["device_source_adapter"],
-                payload["device_entity_count"],
-                now
-            ))
-
+            observation_id = self._insert_observation(cursor, payload, now)
             conn.commit()
             print(
                 f"[STORAGE] Observation logged: {observation_id} "
@@ -568,6 +545,59 @@ class Storage:
             conn.rollback()
             print(f"[STORAGE] WARNING: observation logging failed: {exc}")
             return None
+
+    @staticmethod
+    def _insert_observation(cursor, payload: Dict, now: str) -> str:
+        """INSERT one observation row without committing; returns its id.
+
+        input_id (STEP 7P) is written only when the payload carries one;
+        otherwise the column keeps its NULL default, exactly as before 7P.
+        """
+        from uuid import uuid4
+
+        observation_id = f"obs_{uuid4().hex[:12]}"
+        row = {
+            "id": observation_id,
+            **{key: payload[key] for key in (
+                "observation_group_id", "device_id", "classifier_name",
+                "hypothesis_category", "hypothesis_confidence",
+                "hypothesis_reasoning", "device_name", "device_model",
+                "device_manufacturer", "device_source_adapter",
+                "device_entity_count")},
+            "created_at": now,
+        }
+        if payload.get("input_id") is not None:
+            row["input_id"] = payload["input_id"]
+        cursor.execute(
+            f"INSERT INTO classification_observations ({', '.join(row)}) "
+            f"VALUES ({', '.join('?' for _ in row)})",
+            tuple(row.values()),
+        )
+        return observation_id
+
+    def record_classification_input(self, input_row: Dict,
+                                    observations: List[Dict]) -> List[str]:
+        """STEP 7P: write one input and its observations atomically.
+
+        Either the input and every observation are committed, or nothing is
+        (so the fingerprint gate can never advance without its
+        observations). Each observation payload gets input_id set to the
+        input's id. Returns the observation ids. Raises on failure.
+        """
+        conn = self.connect()
+        cursor = conn.cursor()
+        try:
+            coverage_store.insert_input(cursor, input_row)
+            ids = [
+                self._insert_observation(
+                    cursor, dict(obs, input_id=input_row["id"]), input_row["created_at"])
+                for obs in observations
+            ]
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return ids
 
     def upsert_review_case(
         self,

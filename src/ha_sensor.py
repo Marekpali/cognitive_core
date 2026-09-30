@@ -11,7 +11,7 @@ STEP 4A.2: Event-driven sensor updates.
 
 Design note - synchronous requests, not aiohttp:
 This module is called from two different execution contexts:
-  1. The async main process (CognitiveCore.start(), on_device_detected(),
+  1. The async main process (CognitiveCore.start(), on_snapshot(),
      and the periodic reconcile loop in main.py's main_loop())
   2. The synchronous CLI (main.py's show_review_queue(), invoked via
      `docker exec ... python -m src.main review`)

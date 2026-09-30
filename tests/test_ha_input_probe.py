@@ -20,31 +20,36 @@ MOTION_ENTITY = {"entity_id": "binary_sensor.hall_motion", "device_id": "dev_m",
                  "device_class": None, "original_device_class": "motion"}
 
 
-def _adapter_view(device, entities):
+MOTION_STATE = {"entity_id": "binary_sensor.hall_motion", "state": "off",
+                "attributes": {"device_class": "motion"}}
+
+
+def _adapter_view(device, entities, states):
     """Run the REAL HAAdapter._enrich_device with a canned registry."""
     adapter = HAAdapter(token="t")
+    replies = {"config/entity_registry/list": entities, "get_states": states}
 
-    async def fake_ws_command(command_type):
-        assert command_type == "config/entity_registry/list"
-        return entities
+    async def fake_ws_command(command_type, strict=False):
+        return replies[command_type]
 
     adapter._ws_command = fake_ws_command
     return asyncio.run(adapter._enrich_device(dict(device)))["entities"]
 
 
-def test_current_adapter_drops_device_class_and_uses_platform_as_domain():
-    """Pins the finding: the adapter passes platform ('zha') as domain and
-    no device_class at all."""
-    view = _adapter_view(MOTION_DEVICE, [MOTION_ENTITY])
-    assert view == [{"name": "Motion", "domain": "zha",
-                     "entity_id": "binary_sensor.hall_motion"}]
+def test_step7p_adapter_passes_entity_domain_and_state_device_class():
+    """Probe 7P finding fixed in STEP 7P: domain from entity_id (not the
+    platform) and device_class from get_states attributes."""
+    view = _adapter_view(MOTION_DEVICE, [MOTION_ENTITY], [MOTION_STATE])
+    assert view == [{"entity_id": "binary_sensor.hall_motion",
+                     "domain": "binary_sensor", "name": "Motion",
+                     "device_class": "motion"}]
 
 
-def test_report_shows_motion_invisible_now_and_matched_by_hypothesis():
-    view = {"dev_m": _adapter_view(MOTION_DEVICE, [MOTION_ENTITY])}
+def test_report_after_step7p_matches_motion_on_current_input():
+    states = [MOTION_STATE]
+    view = {"dev_m": _adapter_view(MOTION_DEVICE, [MOTION_ENTITY], states)}
     report = asyncio.run(probe.build_report(
-        [MOTION_DEVICE], [MOTION_ENTITY],
-        [{"entity_id": "binary_sensor.hall_motion", "attributes": {}}],
+        [MOTION_DEVICE], [MOTION_ENTITY], states,
         view, probe.load_classifiers(str(REPO))))
 
     row = report["devices"][0]
@@ -54,13 +59,11 @@ def test_report_shows_motion_invisible_now_and_matched_by_hypothesis():
         "platform": "zha",
         "registry_device_class": None,
         "registry_original_device_class": "motion",
-        "state_device_class": None,
+        "state_device_class": "motion",
     }
-    assert row["matched_current"] == []
+    assert row["matched_current"] == ["motion_sensor"]
     assert row["matched_hypothetical"] == ["motion_sensor"]
-    assert row["integrations"] == ["zha"]
-    assert report["summary"]["devices_changed_by_hypothesis"] == 1
-    assert report["summary"]["no_match_current"] == 1
+    assert report["summary"]["devices_changed_by_hypothesis"] == 0
 
 
 def test_effective_device_class_follows_ha_precedence():

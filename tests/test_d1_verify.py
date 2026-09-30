@@ -25,6 +25,14 @@ def _load_script():
     return module
 
 
+@pytest.fixture(autouse=True)
+def d1_era_schema(monkeypatch):
+    """d1_verify.py checks the database as D1 left it. Reconstruct that
+    schema by switching off the STEP 7P additions (tables, input_id,
+    5 triggers); tests of the post-7P schema live in test_d2_verify.py."""
+    monkeypatch.setattr(Storage, "init_step7p_schema", lambda self, cursor: None)
+
+
 @pytest.fixture
 def dbs():
     """pre_d1.db = pre-M1 database (no triggers); live.db = same after startup."""
@@ -110,3 +118,13 @@ def test_trigger_set_must_be_exact(dbs, sql, expected):
     result = _run(dbs)
     assert result.returncode == 1
     assert expected in result.stdout
+
+
+def test_d1_verify_rejects_a_step7p_database(dbs, monkeypatch):
+    """After D2 the D1 verifier is expected to FAIL (unexpected 7P triggers):
+    it is an evidence tool for the D1 state, superseded by d2_verify.py."""
+    monkeypatch.undo()
+    Storage(dbs / "live.db").connection.close()  # STEP 7P startup
+    result = _run(dbs)
+    assert result.returncode == 1
+    assert "unexpected trigger trg_obs_immutable_input_id" in result.stdout

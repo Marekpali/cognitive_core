@@ -11,10 +11,10 @@ async def main_loop(core: CognitiveCore):
 
     # Listen for device signals
     for adapter in core.adapters.values():
-        asyncio.create_task(adapter.listen(core.on_device_detected))
+        asyncio.create_task(adapter.listen(core.on_snapshot))
 
     # STEP 4A.2: periodic reconcile of the pending-reviews sensor.
-    # Event-driven pushes (core.py's start()/on_device_detected(), and
+    # Event-driven pushes (core.py's start()/on_snapshot(), and
     # show_review_queue()'s approve/reject/correct handlers below) are
     # the primary update mechanism and fire immediately. This loop is
     # only a safety net - it catches drift from anything that bypasses
@@ -42,37 +42,6 @@ async def main_loop(core: CognitiveCore):
             background_tasks.add(task)
             task.add_done_callback(background_tasks.discard)
             elapsed_since_reconcile = 0
-async def test_mock_device():
-    """Test with mock device"""
-    core = CognitiveCore()
-    await core.start()
-
-    test_device = {
-        'id': 'shelly_123',
-        'name': 'Shelly Pro 3EM',
-        'manufacturer': 'Shelly',
-        'area': 'Kitchen',
-        'entities': [
-            {'name': 'Shelly Total Power', 'domain': 'sensor'},
-            {'name': 'Shelly Phase A', 'domain': 'sensor'},
-        ]
-    }
-
-    mock_adapter = core.adapters['mock']
-    await mock_adapter.send_test_device(
-        core.on_device_detected,
-        test_device
-    )
-
-    print("\n[CLI] Pending Review Cases:")
-    cases = core.storage.get_pending_review_cases()
-    for i, case in enumerate(cases, 1):
-        print(
-            f"[{i}] {case['device_name'] or case['device_id']} - "
-            f"{case['hypothesis_category']} "
-            f"({case['hypothesis_confidence']:.0%})"
-        )
-
 # Known classifier output categories. Used to validate manual corrections
 # entered in the CLI so a typo doesn't silently poison the training data.
 # NOTE: this list must stay in sync with the categories the classifiers
@@ -281,8 +250,6 @@ if __name__ == '__main__':
             show_review_stats()
         elif command == 'correction-patterns':
             show_correction_patterns()
-        elif command == 'test':
-            asyncio.run(test_mock_device())
     else:
         core = CognitiveCore()
         try:

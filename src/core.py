@@ -1,17 +1,16 @@
 from pathlib import Path
-from typing import Dict, Optional
 import asyncio
 import os
-from datetime import datetime, timezone
-from uuid import uuid4
 
 from src.storage import Storage
 from src.classifiers.energy import EnergyMeterClassifier
 from src.classifiers.environmental import EnvironmentalSensorClassifier
 from src.classifiers.motion import MotionSensorClassifier
 from src.ha_sensor import update_pending_reviews
+from src.options import read_observation_mode
+from src.sweep import ObservationSweep
 
-CORE_BUILD = "2026-08-01-step2-ha-app"
+CORE_BUILD = "2026-09-30-step7p"
 
 
 class CognitiveCore:
@@ -23,6 +22,8 @@ class CognitiveCore:
         self.storage = Storage(db_path)
         self.classifiers = {}
         self.adapters = {}
+        self.observation_mode = read_observation_mode()
+        self.sweep = None
         # STEP 4A.2: holds references to fire-and-forget sensor-push
         # tasks so they aren't garbage-collected mid-execution (a
         # documented asyncio pitfall - create_task() alone does not
@@ -46,7 +47,7 @@ class CognitiveCore:
         await self.load_adapters()
         print("[CORE] Ready")
         # STEP 4A.2: publish initial sensor state on startup.
-        # asyncio.to_thread: see on_device_detected() below for why
+        # asyncio.to_thread: see on_snapshot() below for why
         # this is not called directly.
         self._fire_and_forget(asyncio.to_thread(update_pending_reviews, self.storage))
 
@@ -55,6 +56,7 @@ class CognitiveCore:
         self.classifiers["environmental_sensor"] = EnvironmentalSensorClassifier()
         self.classifiers["motion_sensor"] = MotionSensorClassifier()
         print(f"[CORE] Loaded {len(self.classifiers)} classifiers")
+        self.sweep = ObservationSweep(self.storage, self.classifiers, self.observation_mode)
 
     async def load_adapters(self):
         from src.adapters.ha import HAAdapter
@@ -69,88 +71,21 @@ class CognitiveCore:
         self.adapters["ha"] = HAAdapter(host=host, token=token, ws_url=ws_url)
         print(f"[CORE] Loaded {len(self.adapters)} adapters")
 
-    async def on_device_detected(self, source: str, device: Dict):
-        print(f"[CORE] Device detected: {device.get('name')}")
+    async def on_snapshot(self, source: str, devices: list, entities: list,
+                          states: list) -> int:
+        """STEP 7P: run one gated sweep over a full registry snapshot.
 
-        hypothesis = await self.classify_device(device, source)
+        Called by the HA adapter for every due sweep (startup/reconnect,
+        daily, debounced registry events). See src/sweep.py. Returns the
+        number of devices skipped for missing metadata, which the adapter's
+        scheduler uses to retry soon (e.g. HA still loading states).
+        """
+        result = await self.sweep.run(source, devices, entities, states)
 
-        # STEP 4A.2: classify_device() may have logged one or more
-        # classification_observations rows (each starts as
-        # review_status='pending'), even if no single hypothesis was
-        # chosen as "best" below. Refresh the sensor unconditionally,
-        # right after classification, so the pending count in Home
-        # Assistant reflects reality regardless of which branch runs
-        # next.
-        #
-        # asyncio.to_thread: update_pending_reviews() is a blocking
-        # call (sqlite3 count + requests.post to the Supervisor proxy).
-        # Calling it directly would stall the event loop for the
-        # duration of the HTTP request - including the HA adapter's
-        # listen() task, which needs to keep processing incoming
-        # WebSocket events. Under a slow or unresponsive Supervisor,
-        # a direct call could block device detection for up to
-        # REQUEST_TIMEOUT_SECONDS. Running it in a thread keeps this
-        # handler responsive regardless of how long the HTTP call takes.
-        self._fire_and_forget(asyncio.to_thread(update_pending_reviews, self.storage))
-
-        if not hypothesis:
-            print("[CORE] No classifier matched")
-            return
-
-        print(f"[CORE] Hypothesis: {hypothesis['category']} ({hypothesis['confidence']})")
-
-        asset_id = self.storage.save_asset({
-            "id": f"asset_{uuid4().hex[:8]}",
-            "lifecycle_discovered_at": datetime.now(timezone.utc).isoformat(),
-            "source_device_id": device.get("id"),
-            "source_adapter": source,
-            "name": device.get("name"),
-            "hypothesis": hypothesis,
-        })
-
-        print(f"[CORE] Asset saved: {asset_id}")
-
-    async def classify_device(self, device: Dict, source: str = "unknown") -> Optional[Dict]:
-        best_hypothesis = None
-        best_score = 0.0
-        observation_group_id = f"obsg_{uuid4().hex[:12]}"
-
-        for classifier_name, classifier in self.classifiers.items():
-            result = await classifier.classify(device)
-            print(f"[CORE] Result from {classifier_name}: {result}")
-
-            if result:
-                observation_id = self.storage.log_classification_observation({
-                    "observation_group_id": observation_group_id,
-                    "device_id": device.get("id") or "unknown",
-                    "classifier_name": classifier_name,
-                    "hypothesis_category": result.get("category") or "unknown",
-                    "hypothesis_confidence": result.get("confidence", 0.0),
-                    "hypothesis_reasoning": result.get("reasoning", ""),
-                    "device_name": device.get("name") or "",
-                    "device_model": device.get("model") or "",
-                    "device_manufacturer": device.get("manufacturer") or "",
-                    "device_source_adapter": source,
-                    "device_entity_count": len(device.get("entities") or []),
-                })
-
-                # STEP 5: only create/refresh the logical review case
-                # when the observation itself was actually persisted.
-                # This is the write path that keeps review_cases (and
-                # therefore sensor.cognitive_core_pending_reviews)
-                # deduplicated per (device_id, classifier_name,
-                # hypothesis_category) instead of growing one entry per
-                # raw observation row.
-                if observation_id:
-                    self.storage.upsert_review_case(
-                        device_id=device.get("id") or "unknown",
-                        classifier_name=classifier_name,
-                        hypothesis_category=result.get("category") or "unknown",
-                        observation_id=observation_id,
-                    )
-
-                if result["confidence"] > best_score:
-                    best_hypothesis = result
-                    best_score = result["confidence"]
-
-        return best_hypothesis
+        # STEP 4A.2: refresh the pending-reviews sensor when this sweep
+        # wrote observations (active mode only). asyncio.to_thread because
+        # update_pending_reviews() blocks (sqlite3 + HTTP to the Supervisor)
+        # and must not stall the adapter's listen() task.
+        if result.observations_written:
+            self._fire_and_forget(asyncio.to_thread(update_pending_reviews, self.storage))
+        return result.counts["skipped_missing_metadata"]
