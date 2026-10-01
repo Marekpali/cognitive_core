@@ -1,11 +1,14 @@
 # D2 — STEP 7P deployment (shadow mode)
 
-**Status:** PROCEDURE — approved conditionally 2026-10-01; conditions met
-(dependency pins, D1-on-D2-schema proof). Nothing deployed yet.
-**Source state:** `8570f77` (package contents); this document is committed
-on top of it without touching any packaged file, and the final package on
-`/share/d2` is rebuilt from that final commit.
-**Production today:** D1 (`d1-deployed`).
+**Status:** Deployment verified — PASS (shadow). 7P readiness: NOT READY (S4
+pending by design).
+**Date:** 2026-10-01
+**Deployed source state:** `8570f77` (package contents; `f848ebe` adds only
+the procedure document, packaged files identical)
+**Verification tools:** `scripts/d2_verify.py` (cumulative D0 + D1 + D2 +
+PINS + DATA + SHADOW), `scripts/shadow_check.py` (S1–S6), both from the same
+package
+**Predecessors:** `docs/D1-DEPLOYMENT.md`, `docs/STEP7_OBSERVATION_SOURCES.md`
 **Gate:** FULL GATE. First production-changing operation: Phase 4.
 
 **Tag meaning.** `d2-deployed` = STEP 7P code and schema deployed **in
@@ -26,10 +29,11 @@ Activation is a separate decision after S1–S6 with its own attestation
 | On startup: `classification_inputs`, `classification_sweeps`, `classification_observations.input_id`, 5 triggers | `classification_observations`, `review_cases`, `assets`, `classification_inputs` — shadow writes none |
 | Every sweep writes one `classification_sweeps` row | |
 
-The 18 old `*_backup.py` files inside HAOS `src/` (in the image, never
-imported) move with the old tree to `backup_d2/src_d1/`; afterwards
-`/app/src` equals the git tree exactly. `assets` stays a historical STEP 1
-table and is expected to stay at its current count (13).
+The 17 old `*_backup.py` files inside HAOS `src/` (in the image, never
+imported) moved with the old tree to `backup_d2/src_d1/` (28 files,
+verified via Samba identical to the pre-D2 tree); `/app/src` now equals the
+git tree exactly. `assets` stays a historical STEP 1 table (13 rows,
+unchanged).
 
 ## Pre-production evidence (local, 2026-10-01)
 
@@ -43,13 +47,11 @@ table and is expected to stay at its current count (13).
   reconnect.
 - **D1-on-D2-schema = PASS** (`tests/test_rollback_d1_on_d2.py`): the exact
   D1 production `storage.py` (`6bb9c184…`) and `core.py` (`c3a70399…`) on a
-  D2-migrated database — startup without error or warning, D1 write path
-  (`on_device_detected` → observation, review case, asset; `input_id` NULL),
-  reads/analytics, D0 protection (second decision `already_resolved` on both
-  paths), D1 and D2 triggers still enforce, roll-forward to D2 with every
-  row and the gate state intact. Rollback A is therefore proven, not assumed.
-- **Negative control rehearsal:** `d2_verify.py` on a pre-D2 database fails
-  only in D2 (tested).
+  D2-migrated database — startup, D1 write path, reads, D0 protection, D1
+  and D2 triggers, roll-forward. Rollback A is proven, not assumed.
+- **Rehearsal on a copy of the real `pre_d2.db`:** negative control as
+  expected; migration + shadow sweep; full `d2_verify` PASS; D1 code on the
+  migrated copy PASS.
 
 ## Package
 
@@ -73,9 +75,7 @@ d0feedc4e71dd306b64e04c40decd953a6fe7fc926cbed3ce97de9a75a673b08  core.py
 032744f35f4d5998bb4d3099c4f966f24a739c78fe6099b2b26052babebb9a4a  adapters/ha.py
 ```
 
----
-
-## Console variables (set once per shell)
+## Console variables
 
 ```
 A=/mnt/data/supervisor/apps/local/cognitive_core
@@ -83,170 +83,180 @@ S=/mnt/data/supervisor/share/d2
 C=app_local_cognitive_core
 ```
 
-## Phase 0 — package integrity (read-only)
+---
+
+## Observed results
+
+### Phase 0 — package integrity: PASS
+`SHA256SUMS` = `9e365163…c1ba8b`; 5× OK; 16× OK in `src/`.
+
+### Phase 1 — baseline (D1 state): PASS
+config `5d8818c9…aeaf904`, requirements `9d5a729d…124ee0d`; `storage.py`,
+`main.py`, `core.py` identical on host and in the container (D1 hashes);
+`/data/options.json` = `{}`; aiohttp `3.14.3`; container `bd21911e2117`, up
+37 h.
+
+### Phase 2 — rollback point: PASS
+`$A/backup_d2/`: `pre_d2.db`
+`6e41d3f9b3097d1ddd12b901ee7fb429f4f4409c5e15b6ceb32055b05abbf36e`
+(111 kB, `integrity_check` ok, same hash in the container and on the host),
+`pre_d2_config.yaml` (originally copied as `config.yaml`, renamed during the
+incident below), `requirements.txt`, `options_pre_d2.json` (`44136fa3…`).
+
+### Phase 3 — negative control (old container): as expected
+D0 PASS, D1 PASS (13/13, 13/13); **D2 FAIL** only for the 8 missing 7P
+elements (5 triggers, 2 tables, `input_id`); PINS 16/17 (old image had
+`charset-normalizer` 3.5.1, pin is 3.5.2 — recorded; the rebuild installs
+the pin); DATA PASS; SHADOW PASS.
+
+### Phase 4 — source deployed: PASS
+`src` moved to `backup_d2/src_d1`, package copied; 16× OK, 16 files,
+config `9cbc1ec0…`, requirements `5d299242…`.
+
+### Phase 5 — rebuild: PASS after the incident below
+After the fix: `ha store reload`, `ha apps rebuild local_cognitive_core
+--force` succeeded; `ha apps info` shows option `observation_mode: shadow`
+and the schema as a list: `observation_mode` select `[shadow, active]`. The
+Supervisor API reports `schema` as a **list**, not a mapping, so a check for
+the procedure's YAML form (`{…}`) cannot match. Rebuild restores the previous
+run state; the add-on was stopped after the failed attempt, so `ha apps
+start local_cognitive_core` was required.
+
+### Phases 6–7 — running container == `8570f77`: PASS
+16/16 hashes OK inside the container, 16 files; `/data/options.json` =
+`{"observation_mode": "shadow"}`; aiohttp `3.14.3`, charset-normalizer
+`3.5.2`. Startup log, in this order (`[STORAGE]` precedes `[OPTIONS]`, the
+procedure listed them the other way round): `STEP 7P schema verified (5
+triggers)`, `backfill_review_cases: 0 created, 0 reconciled`,
+`observation_mode=shadow`, subscribed to `device_registry_updated` and
+`entity_registry_updated`, no errors. First sweep:
 
 ```
-cd $S
-sha256sum SHA256SUMS
-sha256sum -c SHA256SUMS
-cd $S/src
-sha256sum -c ../SRC_SHA256SUMS
+swp_c44be69d702f shadow startup
+discovered=160 no_entities=14 missing_metadata=0 unchanged=0
+classified=18 no_match=128 error=0
+excluded_disabled_entities=357 unavailable_entities=86
 ```
-Expect `9e365163…c1ba8b`, 5× OK, 16× OK. Any mismatch → stop.
 
-## Phase 1 — baseline (read-only)
-
+### Phase 8 — `d2_verify.py` (cumulative): PASS
 ```
-cd $A
-sha256sum config.yaml requirements.txt
-sha256sum src/storage.py src/main.py src/core.py
-docker exec $C sha256sum /app/src/storage.py /app/src/main.py /app/src/core.py
-docker exec $C cat /data/options.json
-docker exec $C python3 -c "import aiohttp;print(aiohttp.__version__)"
-```
-Expect config `5d8818c9…aeaf904`, requirements `9d5a729d…124ee0d`, storage
-`6bb9c184…d13bd3669`, main `d256a2d5…b32676cec`, core `c3a70399…4141fabb1`
-(D1 state; every git-tracked file in HAOS `src/` was verified equal to
-`d1-deployed` via Samba on 2026-10-01).
-
-## Phase 2 — rollback point (writes only backup files)
-
-```
-mkdir $A/backup_d2
-cp $A/config.yaml $A/requirements.txt $A/backup_d2/
-docker exec $C python3 -c "import sqlite3;sqlite3.connect('/data/core.db').backup(sqlite3.connect('/tmp/pre_d2.db'));print('backup ok')"
-docker cp $C:/tmp/pre_d2.db $A/backup_d2/pre_d2.db
-sha256sum $A/backup_d2/*
-docker exec $C sha256sum /tmp/pre_d2.db
-```
-Both `pre_d2.db` hashes equal. Record it.
-
-## Phase 3 — negative control (old container, live DB read-only)
-
-```
-docker cp $S/d2_verify.py $C:/tmp/
-docker exec $C python3 /tmp/d2_verify.py
-```
-Expected — **fails only in D2 elements**:
-```
-D0      PASS
-D1      PASS      13/13 triggers, 13/13 refusals
-D2      FAIL      missing trigger ×5, missing table ×2, missing column input_id
-PINS    FAIL      (unpinned D1 image; lists each differing version — recorded)
-DATA    PASS
-SHADOW  PASS      classification_inputs: table absent
-RESULT: FAIL
-```
-D0 or D1 not PASS → stop: the problem predates D2.
-
-## ⚠ Phase 4 — deploy source (FIRST PRODUCTION-CHANGING STEP)
-
-```
-cd $A
-mv src backup_d2/src_d1
-cp -r $S/src src
-cp $S/config.yaml $S/requirements.txt .
-cd $A/src
-sha256sum -c $S/SRC_SHA256SUMS
-find . -type f | wc -l
-cd $A
-sha256sum config.yaml requirements.txt
-```
-Nothing deleted (old tree moved). Expect 16× OK, `16`, config `9cbc1ec0…`,
-requirements `5d299242…`.
-
-## Phase 5 — reload config + rebuild
-
-```
-ha store reload
-ha apps rebuild local_cognitive_core --force
-ha apps info local_cognitive_core
-```
-`store reload` makes the Supervisor read the new `config.yaml` (fallback:
-Settings → Apps → App store → ⋮ → Check for updates). `apps info` must show
-`observation_mode: shadow`. Supervisor rejects the schema or the build
-fails → rollback A.
-
-## Phase 6 — running container == `8570f77`
-
-```
-docker exec $C sh -c "cd /app/src && sha256sum -c /share/d2/SRC_SHA256SUMS"
-docker exec $C sh -c "find /app/src -type f -not -path '*__pycache__*' | wc -l"
-docker exec $C cat /data/options.json
-docker exec $C python3 -c "import aiohttp;print(aiohttp.__version__)"
-```
-Expect 16× OK, `16`, `{"observation_mode": "shadow"}` (a missing key still
-means shadow — recorded, not a stop), `3.14.3`.
-
-## Phase 7 — startup log
-
-```
-docker logs $C 2>&1 | head -60
-```
-In order: `[OPTIONS] observation_mode=shadow`, `[STORAGE] STEP 7P schema
-verified (5 triggers)`, `backfill_review_cases: 0 created`, `Subscribed to
-device_registry_updated`, `Subscribed to entity_registry_updated`, `[SWEEP]
-swp_… mode=shadow source=startup discovered=… error=0`.
-
-## Phase 8 — `d2_verify.py` (cumulative)
-
-```
-docker cp $A/backup_d2/pre_d2.db $C:/tmp/
-docker cp $S/d2_verify.py $C:/tmp/
-docker exec $C python3 /tmp/d2_verify.py
-```
-(`/tmp` is cleared by the rebuild.) Required, every section:
-```
-D0      PASS   every resolved case re-decided on a copy with the deployed code -> already_resolved
+D0      PASS   2 resolved cases re-decided on a copy -> already_resolved, decision fields identical
 D1      PASS   13/13 triggers, 13/13 exact refusals, review-only UPDATE allowed
-D2      PASS   5/5 triggers, 5/5 exact refusals, no unexpected trigger
-PINS    PASS   every pinned package installed at the pinned version
-DATA    PASS   every pre-D2 row identical; input_id NULL on all pre-D2 observations
-SHADOW  PASS   observations, review_cases, assets equal to the snapshot; inputs 0; sweeps all shadow
+D2      PASS   5/5 triggers, 5/5 exact refusals, unexpected triggers: none
+PINS    PASS   17/17 at the pinned version
+DATA    PASS   assets 13, observations 11, environmental_readings 0, review_cases 2,
+               review_queue 9: +0 new, 0 changed; pre-D2 observations with input_id: 0
+SHADOW  PASS   observations 11/11, review_cases 2/2, assets 13/13, classification_inputs 0
 RESULT: PASS
 ```
-
-## Phase 9 — shadow evidence (first day)
-
+Sweeps at that time (`discovered no_entities missing unchanged classified no_match error`):
 ```
-docker exec $C python3 /share/d2/shadow_check.py
+swp_c44be69d702f shadow startup                  160 14 0   0 18 128 0
+swp_c317dff3830e shadow entity_registry_updated  160 14 0 146  0   0 0
+swp_8b8cf7bccefa shadow entity_registry_updated  160 14 0 146  0   0 0
 ```
-Expected now: S1 MET, S2 MET, S3 MET (or CHECK, differences explained by
-registry changes since Probe 7P), **S4 NOT MET** (needs a daily sweep ≥ 20 h
-after startup), S5 MET, S6 MET → `RESULT: NOT READY`. That is the expected
-D2 end state.
+Two real registry events arrived in the first minutes; both sweeps found all
+146 devices with entities `unchanged` — the fingerprint gate holds on real
+production events (no state values in the fingerprint).
 
-## Phase 10 — attestation
+### Phase 9 — `shadow_check.py`: NOT READY (expected)
+```
+S1 coverage          MET      3 shadow sweeps; latest discovered=160; invariant broken in: none
+S2 errors            MET      errors: none
+S3 probe parity      MET      swp_c44be69d702f {classified 18, matches 20, motion 4} == probe
+S4 gate stability    NOT MET  no daily shadow sweep with a stored baseline at least 20 h older yet
+S5 missing metadata  MET      0/146 = 0.0% (limit 5%)
+S6 no writes         MET      changes since pre-D2: none
+RESULT: NOT READY
+```
+NOT READY only because of S4, which by definition needs real elapsed time.
+No extra sweeps are forced to satisfy it.
 
-This document becomes the attestation with the observed values, is
-committed, and only then tagged `d2-deployed` (= deployed in shadow).
+### Difference to Probe 7P: 14/128 vs 12/130 — explained
+The probe counted every registry entity; 7P excludes disabled entities
+(ADR §5.1; 357 on this instance). Two devices whose entities are **all
+disabled** therefore move from `no_match` to `no_entities`. `classified`
+(18), matches (20) and motion (4) are unchanged, which is what S3 compares.
 
 ---
 
-## After D2 — activation (lightweight FULL GATE, separate decision)
+## Incident — rebuild hijacked by a backup `config.yaml`
 
-After ≥ 1 daily shadow sweep: `shadow_check.py` again. All S1–S6 MET →
-explicit **GO** → `observation_mode: active` in the add-on UI → restart →
-own attestation (proposed tag `7p-active`). Not part of D2.
+**Symptom.** First `ha apps rebuild local_cognitive_core --force` failed
+with `Cannot build app because dockerfile is missing`. The rebuild had
+already removed the old container and image, so the add-on was down
+(`state: error`). Production data was never at risk: `/data/core.db` is in
+the add-on's data volume, untouched by rebuild.
+
+**Cause.** Supervisor 2026.09.3 discovers local apps with a recursive
+`**/config.*` glob and sets the app location to the directory of the file
+found. Phase 2 had copied `config.yaml` into `backup_d2/`; that copy has the
+same slug, so the Supervisor resolved the app's location to `backup_d2/`,
+where there is no `Dockerfile`. A second, older duplicate
+(`config.step4-backup.yaml` in the add-on root) was latent and would have
+caused the same class of problem. A stale `apps.json` location (#6917) was
+ruled out: no location stored there.
+
+**Fix (no uninstall, no `ha supervisor repair`, no `apps.json` edit):**
+```
+mv $A/backup_d2/config.yaml $A/backup_d2/pre_d2_config.yaml
+mv $A/config.step4-backup.yaml $A/step4-backup_config.yaml
+find $A -name 'config.*'          # -> only ./config.yaml
+ha store reload
+ha apps rebuild local_cognitive_core --force
+ha apps start local_cognitive_core
+```
+Then Phases 6–9 as above. Downtime: from the failed rebuild to the start.
+
+**Lessons (applied to every future deployment).**
+1. Never place a file named `config.*` anywhere inside the add-on tree,
+   backups included; name backups `pre_dX_config.yaml`.
+2. Before any rebuild: `find $A -name 'config.*'` must return only
+   `./config.yaml`.
+3. `rebuild` removes the image before building: a failed build means the
+   add-on is down; it does not restart an app that was not running.
+4. `ha apps info` shows the installed snapshot, updated only by a
+   successful install/update/rebuild.
 
 ---
 
-## Rollback
+## Rollback (corrected)
 
-**A — code/config/requirements (any phase ≥ 4)** — proven by
+**A — code/config/requirements** — proven by
 `tests/test_rollback_d1_on_d2.py`:
 ```
 cd $A
 mv src backup_d2/src_d2_failed
 mv backup_d2/src_d1 src
-cp backup_d2/config.yaml backup_d2/requirements.txt .
+cp backup_d2/pre_d2_config.yaml config.yaml
+cp backup_d2/requirements.txt .
+find $A -name 'config.*'
 ha store reload
 ha apps rebuild local_cognitive_core --force
 ```
-Then the Phase 1 hashes must reappear. The D2 tables, `input_id` column and
-5 triggers stay in `/data/core.db`; the D1 code runs on them unchanged
-(tested with the exact D1 production files).
+`find` must show only `./config.yaml`. Then the Phase 1 hashes must
+reappear. The D2 tables, `input_id` and the 5 triggers stay in
+`/data/core.db`; the D1 code runs on them unchanged.
 
 **B — database (break-glass only):** restore `backup_d2/pre_d2.db` with the
-add-on stopped. Loses every write after Phase 2; only if the database
-itself is damaged.
+add-on stopped. Loses every write after Phase 2.
+
+---
+
+## Conclusion
+
+STEP 7P runs in production **in shadow mode**: `8570f77` source, pinned
+dependencies, 5 STEP 7P triggers on top of the 13 D1 triggers, every pre-D2
+row unchanged, D0 decisions still immutable, no observation, input, review
+case or asset written. Classification on the corrected input reproduces
+Probe 7P exactly (18/20/4) and the fingerprint gate is stable on real
+registry events. Tag `d2-deployed` (= deployed in shadow).
+
+## Next
+
+1. After ≥ 1 daily shadow sweep with a baseline ≥ 20 h older:
+   `shadow_check.py` again.
+2. All S1–S6 MET → lightweight FULL GATE, explicit **GO** →
+   `observation_mode: active` in the add-on UI → restart → own attestation
+   and tag `7p-active`.
+3. Then STEP 7a.
