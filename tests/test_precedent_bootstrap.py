@@ -256,10 +256,15 @@ def test_layer_switched_off_after_start_does_not_bootstrap(legacy):
     off.connection.close()
 
 
-def test_lost_transaction_is_raised_and_the_case_stays_pending(legacy, monkeypatch):
-    """If SQLite dropped the transaction, no decision may be written on
-    what is left of it: the resolver raises and the reviewer retries."""
+def test_fatal_transaction_failure_then_retry_gives_exactly_one_resolution(legacy, monkeypatch):
+    """Storage failure (disk full, I/O error): SQLite drops the transaction,
+    so not even the human decision can be written durably. The resolver
+    raises, the case stays pending with no partial decision or annotation;
+    once storage works again the retry resolves it exactly once."""
     storage, ((case, obs), *_) = legacy
+    snapshot = lambda: {table: rows(storage, table) for table in (
+        "review_cases", "classification_observations", *PRECEDENT_TABLES)}
+    before = snapshot()
 
     def lose_transaction(cursor, *args, **kwargs):
         cursor.connection.rollback()
@@ -267,7 +272,19 @@ def test_lost_transaction_is_raised_and_the_case_stays_pending(legacy, monkeypat
     monkeypatch.setattr(precedent_store, "insert_annotation", lose_transaction)
     with pytest.raises(sqlite3.OperationalError):
         storage.resolve_review_case(case, obs, "approved")
+    assert snapshot() == before                       # pending, nothing partial
     assert _case(storage, case)["status"] == "pending"
-    assert _obs(storage, obs)["human_decision"] is None
-    monkeypatch.undo()
+    assert not storage.connect().in_transaction
+
+    monkeypatch.undo()                                # storage repaired
     assert storage.resolve_review_case(case, obs, "approved") == "resolved"
+    assert storage.resolve_review_case(case, obs, "rejected") == "already_resolved"
+    resolved, row = _case(storage, case), _obs(storage, obs)
+    assert (resolved["status"], resolved["decision"], row["human_decision"]) == (
+        "resolved", "approved", "approved")
+    assert count(storage, "classification_observations",
+                 f"WHERE id = '{obs}' AND human_decision IS NOT NULL") == 1
+    (annotation,) = rows(storage, "precedent_annotations")
+    assert annotation["observation_id"] == obs
+    assert annotation["created_at"] < resolved["decided_at"]
+    assert count(storage, "precedent_audit", "WHERE event = 'annotation_failed'") == 0

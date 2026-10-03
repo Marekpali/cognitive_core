@@ -195,6 +195,10 @@ def test_after_the_review_every_annotation_is_consistent(dbs):
             "('class_pattern', 'observation'): 1",
             "('device_precedent', 'observation'): 2",
             "annotations fully consistent: 4/4",
+            # several devices decided for one (classifier, category) is the
+            # class pattern's evidence, not a duplicate: the key is the
+            # logical case (device, classifier, category)
+            "logical keys with more than one labelled observation: 0 (must be 0)",
             "classification_observations: 6 snapshot rows checked, +2 new, "
             "0 pointer(s) advanced, 4 decided since the snapshot"):
         assert expected in result.stdout, expected
