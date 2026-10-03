@@ -1,10 +1,14 @@
 # STEP 7 — Precedent Memory (Architecture Decision Record)
 
 **Status:** Accepted — no implementation code written against this yet
-**Date:** 2026-09-28 (drafted and accepted, with refinements)
+**Date:** 2026-09-28 (drafted and accepted, with refinements);
+**revised 2026-10-03** after STEP 7P (see *Revision 2026-10-03* at the end)
 **Scope of this document:** STEP 7a (shadow mode) only
-**Precondition:** `step6.2-complete` — `review_cases` is the only Human
-Review workflow; `get_correction_patterns()` exists (STEP 6) and is
+**Precondition:** `7p-active` — human decisions (D0), raw hypothesis and
+observation identity (D1) are immutable in production; observations are
+written by the gated sweep of STEP 7P (`docs/STEP7_OBSERVATION_SOURCES.md`),
+each linked to its stored input by `input_id`. `review_cases` is the only
+Human Review workflow; `get_correction_patterns()` exists (STEP 6) and is
 deployed with zero callers (STEP 6.1).
 
 ---
@@ -43,8 +47,8 @@ happening by accident.
 ## The pipeline (to be preserved beyond STEP 7)
 
 ```
-observation
-  → raw classifier hypothesis      (immutable, forever)
+classifier input                   (STEP 7P: canonical snapshot + fingerprint, append-only)
+  → raw classifier hypothesis      (immutable, forever; linked by input_id)
   → precedent annotation           (STEP 7a: recorded, no effect)
   → decision policy                (future, separate ADR — does not exist yet)
 ```
@@ -57,6 +61,9 @@ classifier hypothesis → "corrected" classifier hypothesis
 
 At any point in time it must be answerable, independently:
 
+0. What did the classifier see? → `classification_inputs`, reached through
+   `classification_observations.input_id` (immutable; `NULL` on
+   observations written before STEP 7P — the annotator must accept that)
 1. What did the classifier originally conclude? → `classification_observations`
 2. What had Core learned from humans at that moment? → `precedent_annotations`
 3. What did a policy do with that? → (future) decision-policy log
@@ -75,7 +82,8 @@ At any point in time it must be answerable, independently:
 | Verifiable in 7a? | **No — by construction** (see below) | Yes, when the annotated case is later resolved |
 
 The two are **never combined into one score**, in storage or in reports.
-Each observation gets at most one annotation per memory type.
+Each observation gets at most one annotation per memory type, written
+once and **never refreshed** (see *When an annotation is written*).
 
 They also have **different metrics**, because they are different kinds of
 claim:
@@ -113,9 +121,14 @@ Each item below gets a regression test that compares behaviour with the
 annotation layer enabled vs. disabled:
 
 - raw classifier hypothesis (`hypothesis_category`, `hypothesis_confidence`,
-  `hypothesis_reasoning`) in `classification_observations`
-- `best_hypothesis` selection in `CognitiveCore.classify_device()`
-- the stored asset (`assets` row, including its hypothesis)
+  `hypothesis_reasoning`) in `classification_observations`, and its
+  `input_id`
+- `classification_inputs` rows (snapshot, fingerprint, outcome,
+  `matched_classifiers`)
+- the fingerprint gate: which devices a sweep evaluates and which it
+  reports `unchanged`
+- `classification_sweeps` rows: counts and `devices_json`; an annotator
+  failure must never turn a device's outcome into `error`
 - review routing: which `review_cases` are created, refreshed, pending
 - `sensor.cognitive_core_pending_reviews`
 - what the human sees in the `review` CLI (see *Blind review* below)
@@ -147,12 +160,19 @@ annotation layer enabled vs. disabled:
   record identity immutable, raw hypothesis immutable, review metadata
   mutable. Changing an id would orphan `review_cases.last_observation_id`
   and precedent annotation references.
+- `classification_observations.input_id`: `trg_obs_immutable_input_id`
+  (STEP 7P), same value-change semantics.
 - `precedent_annotations` and `precedent_annotation_evidence`:
-  append-only; `BEFORE UPDATE` and `BEFORE DELETE` triggers abort.
+  append-only; `BEFORE UPDATE` and `BEFORE DELETE` triggers abort, with
+  the STEP 7P convention — names `trg_<table>_no_update` /
+  `trg_<table>_no_delete`, message
+  `APPEND_ONLY: <table> rows cannot be updated|deleted`.
 
-Before adding the first trigger, verify on a copy of the production DB
-that no existing row would be affected by a pending migration and that
-nothing outside the repo (manual scripts) updates raw columns.
+The raw-column and identity triggers are in production since D1, the
+STEP 7P triggers since D2. The new precedent triggers change the expected
+trigger set: `d2_verify.py` / `active_verify.py` report any other trigger
+as *unexpected*, so the 7a deployment needs its own cumulative verifier
+(new file; the old verifiers are not edited).
 
 ---
 
@@ -178,10 +198,58 @@ the intended behaviour.
   stored as `evidence_as_of`.
 - An annotation is **verifiable** only against a decision with
   `decided_at > annotation.created_at`.
-- No backfill of annotations onto historical observations in 7a. Backfill
-  is possible in principle (evidence cut at `observation.created_at`) but
-  is exactly where leakage bugs hide; not worth the risk for the first
-  increment.
+- **No backfill for resolved cases.** A case that was already resolved
+  when the layer starts never gets an annotation for its judged
+  observation. Backfill is possible in principle (evidence cut at
+  `observation.created_at`) but is exactly where leakage bugs hide.
+
+### When an annotation is written
+
+**Normal path (`annotation_trigger = 'observation'`).** For every
+observation written after the layer is enabled: when the observation is
+written (see *Components*). The annotation is the knowledge available at
+the moment of observation. It is **never refreshed** when more decisions
+arrive later, there are no versions, and `UNIQUE(observation_id,
+memory_type)` stays.
+
+**Bootstrap exception for legacy pending cases
+(`annotation_trigger = 'bootstrap_pending'`).** STEP 7P writes an
+observation only when a device's fingerprint changes, so the cases that
+were `pending` before 7a (18 in production on 2026-10-03) would otherwise
+never be annotated and never become verifiable. For those, and only
+those:
+
+- *Eligible:* a `pending` case whose `expected_observation_id` row was
+  created before `precedent_layer_started_at` (persisted once, on the
+  first enabled start) and has no class-pattern annotation.
+- *When:* inside `resolve_review_case()`, on the first effective
+  `pending → resolved`: **after** the `expected_observation_id` (stale)
+  check and the pending guard pass, **before** the human decision is
+  written.
+- *Evidence:* only decisions resolved earlier
+  (`decided_at < annotation.created_at`). The decision being recorded can
+  never be evidence for its own annotation; its `decided_at` is strictly
+  later than `annotation.created_at` (enforced in code, tested).
+- *Atomicity:* annotation, evidence rows and the human decision are
+  written in **one transaction** — both or neither.
+- *Memory type:* class pattern only. A pending case has no resolved
+  precedent for its own key, so there is no device precedent to recall.
+- *Blind review holds:* the annotation is created after the reviewer has
+  entered the decision and is never displayed.
+
+Consequence: resolving the legacy cases one after another lets case #2
+use the decision on #1, #3 use #1–#2, and so on, instead of all of them
+sharing one frozen picture built from the two decisions that existed
+before 7a.
+
+**The bootstrap cohort is not the normal temporal cohort.** Its evidence
+cut-off lies at decision time, later than the observation, so these
+annotations do not show what Core knew *when it observed*. They carry
+their own `annotation_trigger` value and are reported in their own
+section; they are never merged into the figures of the normal cohort.
+
+Decisions made through the deprecated legacy methods
+(`approve_observation()` etc.) get no bootstrap annotation.
 
 ---
 
@@ -209,6 +277,7 @@ CREATE TABLE precedent_annotations (
     id                    TEXT PRIMARY KEY,
     observation_id        TEXT NOT NULL REFERENCES classification_observations(id),
     memory_type           TEXT NOT NULL,   -- 'device_precedent' | 'class_pattern'
+    annotation_trigger    TEXT NOT NULL,   -- 'observation' | 'bootstrap_pending'
 
     -- copied logical key, for joins without going through review_cases
     device_id             TEXT NOT NULL,
@@ -252,6 +321,10 @@ No row is written when a memory type has no evidence at all
 (`sample_size = 0`); report denominators come from
 `classification_observations`, not from this table.
 
+No `input_id` column: the input of an annotated observation is reached
+through `observation_id → classification_observations.input_id`, which is
+immutable.
+
 A correction rate is not stored as a float: `correction_count` and
 `sample_size` are stored, and any ratio is derived at report time (see
 *Small-sample presentation*).
@@ -277,17 +350,17 @@ Every annotation must be explainable months later without consulting
 the then-current database state: *"Why did Cognitive Core produce this
 annotation at that time?"*
 
-Identifiers alone are **not sufficient**, because human decisions are
-currently mutable. Verified 2026-09-28: `resolve_review_case()` does not
-check `status = 'pending'`, so an already-resolved case can be resolved
-again (e.g. `approved` → `corrected:occupancy`) as long as
-`last_observation_id` has not moved, overwriting both `review_cases` and
-the labelled observation row. The legacy `approve_observation()` /
-`reject_observation()` / `correct_observation()` methods can do the same.
+When this ADR was written (2026-09-28) human decisions were mutable: a
+resolved case could be resolved again. D0 closed that (2026-09-29,
+`docs/D0-DEPLOYMENT.md`): a second decision returns `already_resolved` on
+both the case path and the legacy methods, and nothing is overwritten.
 
-Therefore `precedent_annotation_evidence` stores a **copy of the decision
-values** as they were when the annotation was produced, together with the
-identifiers, and `evidence_digest` is a SHA256 over the canonical
+The value-copying snapshot is kept regardless: it makes an annotation
+self-contained — explainable without joins into tables whose protection
+is enforced by application code — and is what `evidence_digest` is
+computed over. `precedent_annotation_evidence` stores a **copy of the
+decision values** as they were when the annotation was produced, together
+with the identifiers, and `evidence_digest` is a SHA256 over the canonical
 (sorted, JSON-serialised) evidence rows plus `policy_version`. The digest
 lets a report detect if the evidence table was ever tampered with, and
 lets two annotations be recognised as built on identical evidence.
@@ -296,9 +369,8 @@ Leave-one-out is recorded implicitly: no evidence row for a
 class-pattern annotation may carry the annotated observation's
 `device_id` — enforced by test, and checkable from the stored snapshot.
 
-Whether re-resolution of a resolved case should be allowed at all is a
-**separate question** (it touches the STEP 5 lifecycle) and is not
-changed by this ADR; the snapshot design is correct either way.
+Re-resolution of a resolved case is refused since D0; the snapshot design
+does not depend on it.
 
 ### `evidence_maturity` is descriptive, not authority
 
@@ -310,8 +382,7 @@ exists**, not whether Core should be trusted. It is produced by
 In STEP 7a the label must not affect, directly or indirectly:
 
 - classifier confidence
-- `best_hypothesis`
-- asset category
+- the fingerprint gate or any sweep outcome
 - review routing
 - any automatic action
 
@@ -336,20 +407,36 @@ thresholds are an output of 7a's data, decided in the 7b ADR.
   `get_correction_patterns()`), `log_precedent_annotation(...)` (writes
   the annotation and its evidence rows in one transaction),
   `get_precedent_report()`.
-- **`CognitiveCore.classify_device()`** — after the observation and
-  `upsert_review_case` are written, call the annotator. The return
-  value is **ignored**; `best_hypothesis` logic is not touched.
+- **`ObservationSweep._persist()`** (`src/sweep.py`, active mode only) —
+  after the input and its observations are committed and
+  `upsert_review_case` has run, call the annotator once per observation
+  written. The return value is **ignored**; the device's outcome, the
+  sweep counts and the gate are not touched. In `observation_mode:
+  shadow` no observation is written, so the annotator does not run.
+- **`Storage.resolve_review_case()`** — the bootstrap exception only (see
+  *When an annotation is written*).
 - **CLI `precedent-report`** — see below.
-- **Kill switch** — `PRECEDENT_SHADOW_ENABLED` (default on), so the
-  layer can be disabled in production without a rebuild.
+- **Kill switch** — an add-on option in `config.yaml`, read by
+  `src/options.py` from `/data/options.json` like `observation_mode`, so
+  the layer can be switched off in production without a rebuild. A
+  missing, unreadable or unknown value means **off**.
 
 ### Failure isolation
 
-The annotator runs in its own `try/except` and its own transaction,
-**after** the observation is committed. Any failure — including the
-`RuntimeError` integrity check shared with `get_correction_patterns()`
-— produces a log line and no annotation, never a lost observation, a
-missed review case, or a stalled HA event loop.
+**Normal path.** The annotator runs in its own `try/except` and its own
+transaction, **after** the observation is committed. Any failure —
+including the `RuntimeError` integrity check shared with
+`get_correction_patterns()` — produces a log line and no annotation,
+never a lost observation or input, a missed review case, a device
+outcome of `error`, or a stalled sweep.
+
+**Bootstrap path.** Deliberately different: annotation and decision share
+one transaction, so a failing annotator means the decision is **not**
+recorded either (refused with a clear message, nothing written, the case
+stays `pending`). A human decision is never lost silently and never
+recorded with a half-written annotation. The way out is the kill switch:
+with the layer off, `resolve_review_case()` behaves exactly as before 7a
+and writes no annotation.
 
 Performance: evidence is small today, so direct SQL per observation is
 acceptable in 7a. Caching is deferred until measured as necessary
@@ -360,7 +447,11 @@ arises" rule).
 
 ## `precedent-report` (not a single accuracy number)
 
-Two separate sections, never merged.
+Separate sections, never merged: device precedent, class pattern
+(normal cohort, `annotation_trigger = 'observation'`), and class pattern
+— bootstrap cohort (`'bootstrap_pending'`, same metrics, own table, with a
+note that its evidence cut-off is the decision time, not the observation
+time).
 
 **Device precedent (recall):**
 
@@ -401,14 +492,16 @@ ratios, not only the headline metrics.
 
 ## Explicitly out of scope for STEP 7a
 
-- Any change to confidence, category, `best_hypothesis`, assets, review
-  routing, or the HA sensor (that is 7b, separate ADR).
+- Any change to confidence, category, inputs, the fingerprint gate,
+  review routing, or the HA sensor (that is 7b, separate ADR).
 - Auto-applying a human decision to repeat observations (7c or later).
 - Cross-key device knowledge ("this device was corrected under another
   classifier, so…") — that is Level 2 knowledge per
   `STEP5_ARCHITECTURE.md`.
 - Modifying classifiers in any way (unchanged Non-Goal, indefinitely).
-- Backfilling annotations onto historical observations.
+- Backfilling annotations onto observations of already resolved cases;
+  refreshing or versioning an existing annotation.
+- Behavioural evidence (own ADR, later).
 
 ---
 
@@ -423,19 +516,33 @@ ratios, not only the headline metrics.
 4. Every annotation stores raw counts, `evidence_as_of`,
    `policy_version`, an evidence snapshot with copied decision values,
    and a verifiable `evidence_digest`; a test re-resolves a contributing
-   case and proves the stored snapshot is unchanged.
+   case, gets `already_resolved`, and proves the stored snapshot is
+   unchanged.
 5. Ties produce `result = 'ambiguous'` with no suggested outcome or
    category.
 6. Leave-one-out and temporal cut-off are covered by tests (a device's
    own decision never appears in its class-pattern evidence; a decision
    made after the annotation never appears in it).
-7. Annotator failure (incl. integrity `RuntimeError`) is tested not to
-   affect observation logging, review cases, or the HA handler.
+7. Annotator failure (incl. integrity `RuntimeError`) on the normal path
+   is tested not to affect inputs, observations, review cases, sweep
+   outcomes/counts, or the HA handler.
+7a. Bootstrap: tests prove (i) annotation + decision are atomic — a
+   failing annotator leaves the case `pending` and writes nothing;
+   (ii) the decision being recorded is never in its own evidence;
+   (iii) resolving legacy cases in sequence grows the evidence of the
+   later ones; (iv) a stale or already-resolved call writes no
+   annotation; (v) only eligible legacy cases are bootstrapped;
+   (vi) with the layer off nothing is annotated and resolution works.
+7b. An existing annotation is never refreshed: later decisions leave it
+   byte-identical (and the triggers refuse UPDATE/DELETE).
 8. `precedent-report` implements the metrics above, with separate
-   sections per memory type, no combined accuracy, and fraction-only
-   ratios below a denominator of 5.
+   sections per memory type and a separate section for the bootstrap
+   cohort, no combined accuracy, and fraction-only ratios below a
+   denominator of 5.
 9. `review` CLI verified not to display annotations (blind review).
-10. Deployed to HAOS with a SHA256 chain of custody, as in STEP 6.1.
+10. Deployed to HAOS as a FULL GATE on the D2 pattern
+    (`docs/D2-DEPLOYMENT.md`): package from git objects, negative control,
+    cumulative verifier (D0 + D1 + D2 + 7a), attestation, then tag.
 11. **Exit condition for 7a is time + data, not code**: 7a runs until
     `precedent-report` shows enough verified class-pattern cases to
     argue a threshold. That number is itself a decision for the 7b ADR.
@@ -458,8 +565,34 @@ ratios, not only the headline metrics.
 1. **Maturity bands.** Initial `insufficient / emerging / established`
    boundaries (descriptive only). To be set when
    `describe_evidence_maturity()` is written.
-2. **Production DB copy** for the trigger pre-check — how to extract it
-   from HAOS (the STEP 6.1 HTTP-bridge approach works in reverse).
-3. **Re-resolution of resolved cases** (found during this review) —
-   intended behaviour or a STEP 5 gap? Out of scope here; the snapshot
-   design does not depend on the answer.
+2. ~~Production DB copy for the trigger pre-check.~~ **Closed:** SQLite
+   backup API inside the container, copied out with `docker cp` / read
+   over Samba (D0–D2).
+3. ~~Re-resolution of resolved cases.~~ **Closed by D0:** refused.
+4. **Where `precedent_layer_started_at` is stored** (it decides bootstrap
+   eligibility and must be written once and not be editable). To be
+   settled in the implementation plan.
+
+## Revision 2026-10-03 (after STEP 7P; no implementation yet)
+
+Reviewed against the closed STEP 7P (`7p-active`). The principle, the two
+memories, blind review, temporal integrity, ties, the evidence snapshot
+and the report are unchanged. Changed:
+
+1. Hook point: `ObservationSweep._persist()` instead of the removed
+   `CognitiveCore.classify_device()`; no annotator in shadow mode.
+2. *Must NOT change*: `best_hypothesis` and asset writes removed (gone
+   since 7P); inputs, `input_id`, the gate and sweep rows added.
+3. Pipeline starts at the stored classifier input; no `input_id` column on
+   annotations (reached through the observation).
+4. Evidence-provenance rationale updated for D0; open question 3 closed.
+5. Trigger section: `trg_obs_immutable_input_id`, STEP 7P naming and
+   message convention, new cumulative verifier; open question 2 closed.
+6. Kill switch is an add-on option, default off on any doubt.
+7. Precondition `7p-active`; deployment as a FULL GATE on the D2 pattern.
+8. **Bootstrap exception for legacy pending cases** (decided 2026-10-03):
+   annotation created inside `resolve_review_case()` immediately before
+   the first decision, in one transaction, evidence = earlier decisions
+   only; own `annotation_trigger`, own report section. Stated explicitly:
+   **no backfill for resolved cases, no refresh of an existing
+   annotation, bootstrap cohort ≠ normal temporal cohort.**
