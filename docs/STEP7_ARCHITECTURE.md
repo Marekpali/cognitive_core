@@ -2,7 +2,8 @@
 
 **Status:** Accepted — no implementation code written against this yet
 **Date:** 2026-09-28 (drafted and accepted, with refinements);
-**revised 2026-10-03** after STEP 7P (see *Revision 2026-10-03* at the end)
+**revised 2026-10-03** after STEP 7P and after the implementation plan
+(`docs/STEP7A_IMPLEMENTATION_PLAN.md`); see *Revision 2026-10-03* at the end
 **Scope of this document:** STEP 7a (shadow mode) only
 **Precondition:** `7p-active` — human decisions (D0), raw hypothesis and
 observation identity (D1) are immutable in production; observations are
@@ -162,8 +163,8 @@ annotation layer enabled vs. disabled:
   and precedent annotation references.
 - `classification_observations.input_id`: `trg_obs_immutable_input_id`
   (STEP 7P), same value-change semantics.
-- `precedent_annotations` and `precedent_annotation_evidence`:
-  append-only; `BEFORE UPDATE` and `BEFORE DELETE` triggers abort, with
+- `precedent_annotations`, `precedent_annotation_evidence` and
+  `precedent_audit`: append-only; `BEFORE UPDATE` and `BEFORE DELETE` triggers abort, with
   the STEP 7P convention — names `trg_<table>_no_update` /
   `trg_<table>_no_delete`, message
   `APPEND_ONLY: <table> rows cannot be updated|deleted`.
@@ -206,9 +207,9 @@ the intended behaviour.
 ### When an annotation is written
 
 **Normal path (`annotation_trigger = 'observation'`).** For every
-observation written after the layer is enabled: when the observation is
-written (see *Components*). The annotation is the knowledge available at
-the moment of observation. It is **never refreshed** when more decisions
+observation written after the layer has started: in the same transaction
+that writes the observation (see *Components* and *Failure isolation*).
+The annotation is the knowledge available at the moment of observation. It is **never refreshed** when more decisions
 arrive later, there are no versions, and `UNIQUE(observation_id,
 memory_type)` stays.
 
@@ -221,10 +222,16 @@ those:
 
 - *Eligible:* a `pending` case whose `expected_observation_id` row was
   created before `precedent_layer_started_at` and has no class-pattern
-  annotation. `precedent_layer_started_at` is the durable cut-off of the
-  layer: written **once**, in the database, on the first enabled start;
-  it survives restarts and is immutable afterwards (where it is stored is
-  left to the implementation plan).
+  annotation.
+- *The cut-off `precedent_layer_started_at`* is the `created_at` of the
+  single `layer_started` row in `precedent_audit`. It is written by Core
+  at its first effective start with `precedent_mode: shadow`, before any
+  observation is written in that mode — never during a run in `off`, so
+  a deployment with the layer off is not the start of the layer. It
+  survives restarts and a temporary return to `off`, and is immutable
+  (partial unique index + append-only triggers). The resolver never
+  writes it: without the row the layer has not started and nothing is
+  bootstrapped.
 - *When:* inside `resolve_review_case()`, on the first effective
   `pending → resolved`: **after** the `expected_observation_id` (stale)
   check and the pending guard pass, **before** the human decision is
@@ -242,11 +249,11 @@ those:
   bootstrap annotation for good (no later backfill) and is recorded as
   `annotation_failed`.
 - *`annotation_failed` is an audit state, not a kind of annotation.* It
-  is a durable record (case, observation, error class, time) kept
-  outside the annotation tables and counted in the report;
-  `annotation_trigger` keeps exactly two values, `observation` and
-  `bootstrap_pending`. Writing the audit record must not be able to
-  block the decision either.
+  is a row in `precedent_audit` (see *Data model*), written on **both**
+  paths with `source` = `observation` or `bootstrap_pending`, counted in
+  the report; `annotation_trigger` keeps exactly two values. Writing the
+  audit row has its own savepoint and can block neither a decision nor
+  a sweep.
 - *Memory type:* class pattern only. A pending case has no resolved
   precedent for its own key, so there is no device precedent to recall.
 - *No evidence is not a failure.* If no earlier decision exists for the
@@ -277,8 +284,15 @@ must either delegate to it or not be reachable as a production resolution
 path. Otherwise a decision could be recorded without the bootstrap step
 and silently fall out of the 7a data. (Today the `review` CLI in
 `src/main.py` calls only `resolve_review_case()`; the legacy methods
-still write decisions with their own SQL.) A test proves there is no
-bypass.
+still write decisions with their own SQL.)
+
+Decided: the legacy methods **delegate**. For the current observation of
+a pending case they call `resolve_review_case()`; for an observation that
+is already decided they return `already_resolved` as before; for anything
+else they return the new result `not_reviewable` and write nothing. An
+explicit break of any old out-of-repo use is preferred over a side road
+around the resolver. A static and a runtime test prove they contain no
+SQL of their own and that there is no bypass.
 
 ---
 
@@ -299,10 +313,8 @@ behind 1 human judgment). Therefore:
 
 ## Data model
 
-Two new tables; existing tables are not changed (their immutability
-triggers are in production since D1/D2). Where the layer's cut-off and
-the `annotation_failed` audit record are stored is left to the
-implementation plan (open question 4).
+Three new tables; existing tables are not changed (their immutability
+triggers are in production since D1/D2).
 
 ```sql
 CREATE TABLE precedent_annotations (
@@ -357,6 +369,31 @@ No `input_id` column: the input of an annotated observation is reached
 through `observation_id → classification_observations.input_id`, which is
 immutable.
 
+One audit table carries both the layer cut-off and annotation failures:
+
+```sql
+CREATE TABLE precedent_audit (
+    id             TEXT PRIMARY KEY,
+    event          TEXT NOT NULL CHECK (event IN ('layer_started', 'annotation_failed')),
+    source         TEXT CHECK (source IN ('observation', 'bootstrap_pending')),
+    observation_id TEXT,
+    review_case_id TEXT,
+    error_class    TEXT,
+    error_message  TEXT,
+    policy_version TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    CHECK (
+        (event = 'layer_started'     AND source IS NULL)
+     OR (event = 'annotation_failed' AND source IN ('observation', 'bootstrap_pending'))
+    )
+);
+CREATE UNIQUE INDEX idx_precedent_layer_started
+    ON precedent_audit(event) WHERE event = 'layer_started';
+```
+
+Append-only like the annotation tables. It is an audit only: nothing
+reads it except the report and the verifier.
+
 A correction rate is not stored as a float: `correction_count` and
 `sample_size` are stored, and any ratio is derived at report time (see
 *Small-sample presentation*).
@@ -407,7 +444,11 @@ does not depend on it.
 ### `evidence_maturity` is descriptive, not authority
 
 `insufficient | emerging | established` describes **how much evidence
-exists**, not whether Core should be trusted. It is produced by
+exists**, not whether Core should be trusted. The bands: `insufficient`
+< 3, `emerging` 3–9, `established` ≥ 10 independent labelled cases
+(`sample_size`). The label is **purely a function of that count**: no
+branch, ranking or decision may depend on it, and the report always
+shows the real `n` next to it. It is produced by
 `describe_evidence_maturity()` — deliberately not named
 `classify_strength()` or anything that sounds like a decision.
 
@@ -431,36 +472,43 @@ thresholds are an output of 7a's data, decided in the 7b ADR.
 - **`src/learning/precedent.py`** — pure functions, no I/O:
   - `evaluate_device_precedent(key, resolved_decision) -> Annotation | None`
   - `evaluate_class_pattern(key, decisions_excluding_device) -> Annotation | None`
-  - `describe_evidence_maturity(sample_size, distribution) -> str`
+  - `describe_evidence_maturity(sample_size) -> str`
   - `evidence_digest(evidence_rows, policy_version) -> str`
 - **`Storage`** — `get_precedent_evidence(key, as_of)` (reads decisions
   directly from `classification_observations` with
   `human_decision IS NOT NULL`, same integrity rules as
   `get_correction_patterns()`), `log_precedent_annotation(...)` (writes
-  the annotation and its evidence rows in one transaction),
+  the annotation and its evidence rows atomically, inside the caller's
+  savepoint),
   `get_precedent_report()`.
 - **`ObservationSweep._persist()`** (`src/sweep.py`, active mode only) —
-  after the input and its observations are committed and
-  `upsert_review_case` has run, call the annotator once per observation
-  written. The return value is **ignored**; the device's outcome, the
-  sweep counts and the gate are not touched. In `observation_mode:
-  shadow` no observation is written, so the annotator does not run.
+  one transaction per evaluated device: input → observations → review
+  cases → the annotator in a `SAVEPOINT`, once per observation written.
+  Its result is **ignored**; the device's outcome, the sweep counts and
+  the gate are not touched. In `observation_mode: shadow` no observation
+  is written, so the annotator does not run.
 - **`Storage.resolve_review_case()`** — the bootstrap exception only (see
   *When an annotation is written*).
 - **CLI `precedent-report`** — see below.
-- **Kill switch** — an add-on option in `config.yaml`, read by
-  `src/options.py` from `/data/options.json` like `observation_mode`, so
-  the layer can be switched off in production without a rebuild. A
-  missing, unreadable or unknown value means **off**.
+- **Switch** — add-on option `precedent_mode: off | shadow` in
+  `config.yaml`, read by `src/options.py` from `/data/options.json` like
+  `observation_mode`, so the layer can be switched without a rebuild.
+  Default, and any missing, unreadable or unknown value: **off**. After
+  the first `shadow` start, `off` is an emergency mode: observations
+  written while it is off are knowingly never annotated afterwards.
 
 ### Failure isolation
 
-**Normal path.** The annotator runs in its own `try/except` and its own
-transaction, **after** the observation is committed. Any failure —
-including the `RuntimeError` integrity check shared with
-`get_correction_patterns()` — produces a log line and no annotation,
-never a lost observation or input, a missed review case, a device
-outcome of `error`, or a stalled sweep.
+**Normal path.** Input, observations and review cases are written in one
+transaction and the annotator runs inside it, in its own `SAVEPOINT`.
+Any failure — including the `RuntimeError` integrity check shared with
+`get_correction_patterns()` — rolls back that savepoint only and leaves
+an `annotation_failed` row (`source = 'observation'`); the transaction
+commits normally. It never causes a lost observation or input, a missed
+review case, a device outcome of `error`, or a stalled sweep. Because
+everything commits together there is no window in which an observation
+exists with neither an annotation nor an audit row, and none in which a
+case could be resolved between its creation and its normal annotation.
 
 **Bootstrap path.** Same principle, different mechanism: the annotation
 shares the decision's transaction but lives in its own `SAVEPOINT`. A
@@ -483,7 +531,8 @@ Separate sections, never merged: device precedent, class pattern
 (normal cohort, `annotation_trigger = 'observation'`), and class pattern
 — bootstrap cohort (`'bootstrap_pending'`, same metrics, own table, with a
 note that its evidence cut-off is the decision time, not the observation
-time, plus the number of legacy cases resolved as `annotation_failed`).
+time). `annotation_failed` counts are shown per `source`. Every maturity
+label is shown with its `n`.
 
 **Device precedent (recall):**
 
@@ -557,7 +606,10 @@ ratios, not only the headline metrics.
    made after the annotation never appears in it).
 7. Annotator failure (incl. integrity `RuntimeError`) on the normal path
    is tested not to affect inputs, observations, review cases, sweep
-   outcomes/counts, or the HA handler.
+   outcomes/counts, or the HA handler; it leaves no partial annotation
+   and exactly one `annotation_failed` row. Input, observations, cases
+   and annotation commit in one transaction (tested with an injected
+   crash before the commit).
 7a. Bootstrap: tests prove (i) a failing annotator (while computing,
    and while writing the annotation or its evidence) leaves the human
    decision committed, **no** partial annotation or evidence row, and an
@@ -565,8 +617,9 @@ ratios, not only the headline metrics.
    never in its own evidence; (iii) resolving legacy cases in sequence
    grows the evidence of the later ones; (iv) a stale or already-resolved
    call writes no annotation; (v) only eligible legacy cases are
-   bootstrapped, and the cut-off `precedent_layer_started_at` is written
-   once and unchanged by a restart; (vi) with the layer off nothing is
+   bootstrapped, and the cut-off `precedent_layer_started_at` is never
+   written in `off`, written once at the first `shadow` start, and
+   unchanged by a restart or a return to `off`; (vi) with the layer off nothing is
    annotated and resolution works; (vii) no bypass: every production
    path `pending → resolved` passes the canonical resolver.
 7b. An existing annotation is never refreshed: later decisions leave it
@@ -598,17 +651,14 @@ ratios, not only the headline metrics.
 
 ## Open questions
 
-1. **Maturity bands.** Initial `insufficient / emerging / established`
-   boundaries (descriptive only). To be set when
-   `describe_evidence_maturity()` is written.
+1. ~~Maturity bands.~~ **Closed:** < 3 / 3–9 / ≥ 10, see
+   *`evidence_maturity` is descriptive*.
 2. ~~Production DB copy for the trigger pre-check.~~ **Closed:** SQLite
    backup API inside the container, copied out with `docker cp` / read
    over Samba (D0–D2).
 3. ~~Re-resolution of resolved cases.~~ **Closed by D0:** refused.
-4. **Physical storage of `precedent_layer_started_at` and of the
-   `annotation_failed` audit record.** Semantics are fixed above (written
-   once / durable, immutable, append-only); the form is settled in the
-   implementation plan.
+4. ~~Physical storage of `precedent_layer_started_at` and of the
+   `annotation_failed` audit record.~~ **Closed:** `precedent_audit`.
 
 ## Revision 2026-10-03 (after STEP 7P; no implementation yet)
 
@@ -639,3 +689,11 @@ and the report are unchanged. Changed:
    `annotation_failed` (an audit state, not an `annotation_trigger`).
 10. **One canonical resolver**: no production resolution path may bypass
     `resolve_review_case()`; legacy methods delegate or are unreachable.
+11. **From the accepted implementation plan:** `annotation_failed` is
+    recorded on both paths, with `source`; one `precedent_audit` table
+    holds it and the `layer_started` cut-off, which is written only at
+    the first `shadow` start and never in `off`; option
+    `precedent_mode: off | shadow`; the normal path annotates inside the
+    `_persist()` transaction via `SAVEPOINT`; legacy methods delegate
+    with the new result `not_reviewable`; maturity bands fixed as a pure
+    function of the evidence count. Open questions 1 and 4 closed.
