@@ -384,7 +384,8 @@ CREATE TABLE precedent_audit (
     created_at     TEXT NOT NULL,
     CHECK (
         (event = 'layer_started'     AND source IS NULL)
-     OR (event = 'annotation_failed' AND source IN ('observation', 'bootstrap_pending'))
+     OR (event = 'annotation_failed' AND source IS NOT NULL
+         AND source IN ('observation', 'bootstrap_pending'))
     )
 );
 CREATE UNIQUE INDEX idx_precedent_layer_started

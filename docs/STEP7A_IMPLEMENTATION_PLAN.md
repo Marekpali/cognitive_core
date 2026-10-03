@@ -42,7 +42,8 @@ CREATE TABLE precedent_audit (
     created_at     TEXT NOT NULL,
     CHECK (
         (event = 'layer_started'     AND source IS NULL)
-     OR (event = 'annotation_failed' AND source IN ('observation', 'bootstrap_pending'))
+     OR (event = 'annotation_failed' AND source IS NOT NULL
+         AND source IN ('observation', 'bootstrap_pending'))
     )
 );
 CREATE UNIQUE INDEX idx_precedent_layer_started
@@ -321,7 +322,8 @@ Existing suite (247) must stay green; coverage of the new modules ≥ 80 %.
 
 | Section | Checks |
 |---|---|
-| D0, D1, PINS, DATA | reused from `d2_verify.py` |
+| D0, D1, PINS | reused from `d2_verify.py` |
+| DATA | every `pre_d3.db` row still present; a human decision present in the snapshot is identical; an undecided observation/case may have been decided **once** (review fields only); a case pointer may only advance to evidence newer than the snapshot. (`d2_verify`'s rule "pre-D2 observations keep `input_id` NULL" does not apply to a post-7P snapshot.) |
 | D2 | the 5 STEP 7P triggers, exact refusals |
 | D3 | the 6 precedent triggers, tables, CHECKs; exact refusals on a copy; **no trigger outside the 24 expected** |
 | RESOLVER | on a copy, deployed code: legacy methods cannot label a non-current observation; no decision path other than the resolver |
@@ -338,7 +340,8 @@ the six new triggers as unexpected, by design.
 **D3 — code and schema, layer off (FULL GATE).** Phases as in D2:
 package from git objects → baseline → `pre_d3.db` backup (never a file
 named `config.*` in the tree; `find` check before rebuild) → negative
-control with the old container (D3 FAIL only) → deploy `src/` +
+control with the old container (D0, D1, D2, PINS, DATA pass; D3,
+RESOLVER, LAYER, REHEARSAL fail) → deploy `src/` +
 `config.yaml` → rebuild → **start** → hashes → log
 (`precedent_mode=off`, `STEP 7a schema verified (6 triggers)`, active
 sweep `unchanged`) → `d3_verify` all PASS with `LAYER` never started
