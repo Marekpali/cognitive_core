@@ -3,7 +3,6 @@
 import subprocess
 import sys
 import tempfile
-import warnings
 from pathlib import Path
 
 import pytest
@@ -55,9 +54,9 @@ def test_clean_database_passes_and_is_not_modified(db_dir):
     assert "[INFO] review_cases pending: 1" in result.stdout
     assert "[INFO] review_cases resolved: 1" in result.stdout
     assert "[INFO] observations carrying a human decision: 1" in result.stdout
-    # Storage now creates the 13 M1 triggers (12 raw + identity) and the 5
-    # STEP 7P triggers; listed as INFO.
-    assert "[INFO] SQLite triggers: 18 (trg_classification_inputs_no_delete" in result.stdout
+    # Storage now creates the 13 M1 triggers (12 raw + identity), the 5
+    # STEP 7P triggers and the 6 STEP 7a triggers; listed as INFO.
+    assert "[INFO] SQLite triggers: 24 (trg_classification_inputs_no_delete" in result.stdout
     assert "script SHA256:" in result.stdout and "database size:" in result.stdout
     assert DEVICE_NAME not in result.stdout
     assert (db_dir / "clean.db").read_bytes() == before
@@ -65,10 +64,11 @@ def test_clean_database_passes_and_is_not_modified(db_dir):
 
 def test_inconsistencies_fail_and_report_ids_only(db_dir):
     storage = _build_db(db_dir / "broken.db")
-    # legacy path labels the evidence row of a still-pending case
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        storage.approve_observation(storage.pending_obs)
+    # the evidence row of a still-pending case gets labelled (before STEP 7a
+    # the legacy methods could do this; now only a write from outside can)
+    storage.connect().execute(
+        "UPDATE classification_observations SET review_status = 'reviewed', "
+        "human_decision = 'approved' WHERE id = ?", (storage.pending_obs,))
     # resolved case whose decision no longer matches its labelled observation
     storage.connect().execute(
         "UPDATE review_cases SET decision = 'approved', corrected_category = NULL "

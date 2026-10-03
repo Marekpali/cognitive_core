@@ -8,7 +8,9 @@ from typing import Dict, Optional, List
 import json
 import warnings
 
-from src import coverage_store
+from src import coverage_store, precedent_annotator, precedent_store
+from src.learning.precedent import POLICY_VERSION
+from src.options import read_precedent_mode
 
 
 # M1 (docs/STEP7_ARCHITECTURE.md): the raw classifier observation is
@@ -37,6 +39,17 @@ RAW_HYPOTHESIS_COLUMNS = (
 # hypothesis immutable, review metadata mutable.
 OBSERVATION_IDENTITY_TRIGGER = "trg_obs_immutable_id"
 
+def _instant(timestamp: str) -> datetime:
+    return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+
+
+def _strictly_after(timestamp: str) -> str:
+    """The smallest representable timestamp later than `timestamp`."""
+    from datetime import timedelta
+
+    return (_instant(timestamp) + timedelta(microseconds=1)).isoformat().replace("+00:00", "Z")
+
+
 class DecisionResult(str):
     """Outcome of a legacy observation-level decision (STEP 6.4).
 
@@ -63,7 +76,8 @@ class DecisionResult(str):
 class Storage:
     """SQLite-based operational data storage"""
 
-    def __init__(self, db_path: Optional[Path] = None):
+    def __init__(self, db_path: Optional[Path] = None,
+                 precedent_mode: Optional[str] = None):
         """Initialize storage, resolving the database path.
 
         STEP 4A.1b: db_path resolution order:
@@ -95,6 +109,13 @@ class Storage:
         if not self.db_path.parent.exists():
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = None
+        # STEP 7a: "off" | "shadow". Resolved from the add-on options when
+        # not given, so the review CLI (a separate process) sees the same
+        # setting as Core.
+        self.precedent_mode = (
+            precedent_mode if precedent_mode is not None
+            else read_precedent_mode(announce=False)
+        )
         self.init_schema()
 
     def init_schema(self):
@@ -185,6 +206,10 @@ class Storage:
 
         # STEP 7P: classifier inputs, sweep records, input_id link
         self.init_step7p_schema(cursor)
+
+        # STEP 7a: precedent annotations, evidence snapshot, layer audit.
+        # Created on every start, whatever precedent_mode says.
+        self.init_step7a_schema(cursor)
 
         # STEP 3: Ensure review columns exist (idempotent migration)
         self._ensure_review_columns(conn)
@@ -305,6 +330,29 @@ class Storage:
         Separate method so tests can reconstruct a D1-era database.
         """
         coverage_store.ensure_schema(cursor)
+
+    def init_step7a_schema(self, cursor) -> None:
+        """STEP 7a tables and their append-only triggers (idempotent).
+
+        Separate method so tests can reconstruct a STEP 7P-era database.
+        """
+        precedent_store.ensure_schema(cursor)
+
+    def ensure_precedent_layer_started(self) -> str:
+        """Write the precedent layer's cut-off once and return it.
+
+        Called only by CognitiveCore, at its first start with
+        precedent_mode 'shadow', before any observation is written in that
+        mode. Never in 'off', never by the resolver.
+        """
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return precedent_store.ensure_layer_started(self.connect(), now, POLICY_VERSION)
+
+    def _precedent_layer_started_at(self, cursor) -> Optional[str]:
+        """The cut-off if the layer is enabled and has started, else None."""
+        if self.precedent_mode != "shadow":
+            return None
+        return precedent_store.layer_started_at(cursor)
 
     def init_review_cases_schema(self, cursor):
         """Create review_cases table.
@@ -599,6 +647,60 @@ class Storage:
             raise
         return ids
 
+    def record_classification(self, input_row: Dict, observations: List[Dict]) -> List[str]:
+        """STEP 7a: everything one evaluated device produces, in ONE
+        transaction: input -> observations -> review cases -> precedent
+        annotations.
+
+        The input and its observations are all-or-nothing, as in
+        record_classification_input(). Each review case is refreshed in its
+        own SAVEPOINT: review cases are derived state, so a failing upsert
+        rolls back only itself (backfill_review_cases() reconciles it on
+        the next start) and never the input, the observations or another
+        case. The precedent annotator likewise runs in a savepoint per
+        observation and cannot fail this transaction.
+
+        Committing together means no crash can leave an observation
+        without its review case and annotation (or the audit of a failed
+        annotation), and no case can be resolved between its creation and
+        its annotation. Returns the observation ids. Raises on failure of
+        the input or an observation.
+        """
+        conn = self.connect()
+        cursor = conn.cursor()
+        try:
+            if not conn.in_transaction:
+                cursor.execute("BEGIN IMMEDIATE")
+            coverage_store.insert_input(cursor, input_row)
+            ids = [
+                self._insert_observation(
+                    cursor, dict(obs, input_id=input_row["id"]), input_row["created_at"])
+                for obs in observations
+            ]
+            for obs, observation_id in zip(observations, ids):
+                self._upsert_review_case_isolated(cursor, obs, observation_id)
+            if self._precedent_layer_started_at(cursor) is not None:
+                for observation_id in ids:
+                    precedent_annotator.annotate_in_transaction(cursor, observation_id)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return ids
+
+    def _upsert_review_case_isolated(self, cursor, obs: Dict, observation_id: str) -> None:
+        """One review-case upsert in its own savepoint; never raises."""
+        cursor.execute("SAVEPOINT review_case")
+        try:
+            self._upsert_review_case(
+                cursor, obs["device_id"], obs["classifier_name"],
+                obs["hypothesis_category"], observation_id)
+        except Exception as exc:
+            cursor.execute("ROLLBACK TO review_case")
+            print(f"[SWEEP] WARNING: review case refresh failed for "
+                  f"{obs['device_id']}: {exc!r} (reconciled on next start)")
+        cursor.execute("RELEASE review_case")
+
     def upsert_review_case(
         self,
         device_id: str,
@@ -627,10 +729,19 @@ class Storage:
         of the DO UPDATE clause - a resolved case never reopens just
         because the same hypothesis was observed again.
         """
-        from uuid import uuid4
-
         conn = self.connect()
         cursor = conn.cursor()
+        real_case_id = self._upsert_review_case(
+            cursor, device_id, classifier_name, hypothesis_category, observation_id)
+        conn.commit()
+        return real_case_id
+
+    @staticmethod
+    def _upsert_review_case(cursor, device_id: str, classifier_name: str,
+                            hypothesis_category: str, observation_id: str) -> str:
+        """The upsert itself, on the caller's cursor, without committing."""
+        from uuid import uuid4
+
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         case_id = f"case_{uuid4().hex[:8]}"
 
@@ -659,13 +770,12 @@ class Storage:
                 )
         ''', (case_id, device_id, classifier_name, hypothesis_category,
               observation_id, now, now))
-        conn.commit()
 
         cursor.execute('''
             SELECT id FROM review_cases
             WHERE device_id = ? AND classifier_name = ? AND hypothesis_category = ?
         ''', (device_id, classifier_name, hypothesis_category))
-        real_case_id = cursor.fetchone()['id']
+        real_case_id = cursor.fetchone()[0]
         print(f"[STORAGE] Review case upserted: {real_case_id}")
         return real_case_id
 
@@ -766,9 +876,46 @@ class Storage:
 
         conn = self.connect()
         cursor = conn.cursor()
-        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         try:
+            # STEP 7a: take the write lock BEFORE the checks, so that the
+            # state they see cannot change until the decision is committed.
+            if not conn.in_transaction:
+                cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                'SELECT status, last_observation_id FROM review_cases WHERE id = ?',
+                (case_id,))
+            row = cursor.fetchone()
+            if row is None:
+                conn.rollback()
+                print(f"[STORAGE] WARNING: resolve_review_case found no case for {case_id}")
+                return 'not_found'
+            if row['status'] != 'pending':
+                conn.rollback()
+                print(f"[STORAGE] WARNING: resolve_review_case refused - {case_id} "
+                      f"is already {row['status']}; existing decision kept")
+                return 'already_resolved'
+            if row['last_observation_id'] != expected_observation_id:
+                conn.rollback()
+                print(f"[STORAGE] WARNING: resolve_review_case stale - {case_id} "
+                      f"no longer points at {expected_observation_id}")
+                return 'stale'
+
+            # STEP 7a bootstrap: a case that was pending before the layer
+            # started is annotated now - after the checks, before the
+            # decision exists - in a savepoint. It cannot fail or delay
+            # the human decision, and the decision cannot be its own
+            # evidence.
+            annotated_at = None
+            layer_started_at = self._precedent_layer_started_at(cursor)
+            if layer_started_at is not None:
+                annotated_at = precedent_annotator.bootstrap_in_transaction(
+                    cursor, case_id, expected_observation_id, layer_started_at)
+
+            now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            if annotated_at is not None and _instant(now) <= _instant(annotated_at):
+                now = _strictly_after(annotated_at)
+
             cursor.execute('''
                 UPDATE review_cases
                 SET status = 'resolved',
@@ -779,20 +926,11 @@ class Storage:
                 WHERE id = ? AND last_observation_id = ? AND status = 'pending'
             ''', (decision, corrected_category, now, now, case_id, expected_observation_id))
 
-            if cursor.rowcount == 0:
-                conn.rollback()
-                cursor.execute('SELECT status FROM review_cases WHERE id = ?', (case_id,))
-                row = cursor.fetchone()
-                if row is None:
-                    print(f"[STORAGE] WARNING: resolve_review_case found no case for {case_id}")
-                    return 'not_found'
-                if row['status'] != 'pending':
-                    print(f"[STORAGE] WARNING: resolve_review_case refused - {case_id} "
-                          f"is already {row['status']}; existing decision kept")
-                    return 'already_resolved'
-                print(f"[STORAGE] WARNING: resolve_review_case stale - {case_id} "
-                      f"no longer points at {expected_observation_id}")
-                return 'stale'
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"Expected exactly one review case {case_id} to be resolved, "
+                    f"got {cursor.rowcount}"
+                )
 
             cursor.execute('''
                 UPDATE classification_observations
@@ -1481,7 +1619,8 @@ class Storage:
         reason: Optional[str],
         reviewed_by: str,
     ) -> DecisionResult:
-        """Shared write path for the three legacy decision methods."""
+        """Shared entry of the three legacy decision methods: delegates to
+        resolve_review_case(); writes nothing itself."""
         warnings.warn(
             f"Storage.{method}() is deprecated; use resolve_review_case()",
             DeprecationWarning,
@@ -1489,37 +1628,38 @@ class Storage:
         )
         conn = self.connect()
         cursor = conn.cursor()
-        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-        cursor.execute('''
-            UPDATE classification_observations
-            SET
-                review_status = 'reviewed',
-                human_decision = ?,
-                corrected_category = ?,
-                reviewed_at = ?,
-                review_reason = ?,
-                reviewed_by = ?
-            WHERE id = ? AND human_decision IS NULL
-        ''', (decision, corrected_category, now, reason, reviewed_by, observation_id))
-
-        if cursor.rowcount == 0:
-            conn.rollback()
-            cursor.execute(
-                "SELECT human_decision FROM classification_observations WHERE id = ?",
-                (observation_id,),
-            )
-            row = cursor.fetchone()
-            if row is None:
-                print(f"[STORAGE] WARNING: {method} found no row for {observation_id}")
-                return DecisionResult("not_found")
+        cursor.execute(
+            "SELECT human_decision, device_id, classifier_name, hypothesis_category "
+            "FROM classification_observations WHERE id = ?",
+            (observation_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            print(f"[STORAGE] WARNING: {method} found no row for {observation_id}")
+            return DecisionResult("not_found")
+        if row['human_decision'] is not None:
             print(f"[STORAGE] WARNING: {method} refused - {observation_id} already "
                   f"has human_decision={row['human_decision']!r}; existing decision kept")
             return DecisionResult("already_resolved")
 
-        conn.commit()
-        print(f"[STORAGE] Observation {decision}: {observation_id}")
-        return DecisionResult("resolved")
+        # STEP 7a: no write path of its own. A decision is recorded only by
+        # the canonical resolver, and only for the observation a pending
+        # review case currently points at.
+        cursor.execute(
+            "SELECT id FROM review_cases WHERE last_observation_id = ? AND status = 'pending' "
+            "AND device_id = ? AND classifier_name = ? AND hypothesis_category = ?",
+            (observation_id, row['device_id'], row['classifier_name'],
+             row['hypothesis_category']),
+        )
+        case = cursor.fetchone()
+        if case is None:
+            print(f"[STORAGE] WARNING: {method} refused - {observation_id} is not the "
+                  f"current evidence of a pending review case; nothing written")
+            return DecisionResult("not_reviewable")
+        return DecisionResult(self.resolve_review_case(
+            case['id'], expected_observation_id=observation_id, decision=decision,
+            reason=reason, corrected_category=corrected_category, reviewed_by=reviewed_by,
+        ))
 
     def insert_environmental_reading(self, asset_id: str, data: Dict) -> int:
         """Insert environmental sensor reading"""

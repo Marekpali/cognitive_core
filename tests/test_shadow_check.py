@@ -27,6 +27,14 @@ check = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(check)
 
 SYNTHETIC = {"classified": 3, "matches": 4, "motion": 2}
+
+
+@pytest.fixture(autouse=True)
+def _step7p_era(monkeypatch):
+    """This verifier belongs to the STEP 7P-era database: build the test
+    databases without the STEP 7a tables and triggers (which it would,
+    correctly, report as unexpected)."""
+    monkeypatch.setattr(Storage, "init_step7a_schema", lambda self, cursor: None)
 ORIGIN = datetime(2026, 10, 1, tzinfo=timezone.utc)
 
 

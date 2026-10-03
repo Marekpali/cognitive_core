@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from src.coverage_store import STEP7P_TRIGGERS
+from src.precedent_store import PRECEDENT_TRIGGERS
 from src.storage import RAW_HYPOTHESIS_COLUMNS, Storage
 from tests.test_storage import _obs, _resolved_case
 
@@ -210,4 +211,4 @@ def test_adding_triggers_to_existing_database_changes_no_data():
     assert after == before
     assert len(raw_triggers) == 12
     assert all_triggers == sorted(
-        raw_triggers + ["trg_obs_immutable_id", *STEP7P_TRIGGERS])
+        raw_triggers + ["trg_obs_immutable_id", *STEP7P_TRIGGERS, *PRECEDENT_TRIGGERS])

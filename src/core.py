@@ -7,10 +7,10 @@ from src.classifiers.energy import EnergyMeterClassifier
 from src.classifiers.environmental import EnvironmentalSensorClassifier
 from src.classifiers.motion import MotionSensorClassifier
 from src.ha_sensor import update_pending_reviews
-from src.options import read_observation_mode
+from src.options import read_observation_mode, read_precedent_mode
 from src.sweep import ObservationSweep
 
-CORE_BUILD = "2026-09-30-step7p"
+CORE_BUILD = "2026-10-03-step7a"
 
 
 class CognitiveCore:
@@ -19,7 +19,8 @@ class CognitiveCore:
     def __init__(self, knowledge_path: Path = Path("data")):
         self.knowledge_path = knowledge_path
         db_path = Path(os.getenv("DB_PATH", str(knowledge_path / "core.db")))
-        self.storage = Storage(db_path)
+        self.precedent_mode = read_precedent_mode()
+        self.storage = Storage(db_path, precedent_mode=self.precedent_mode)
         self.classifiers = {}
         self.adapters = {}
         self.observation_mode = read_observation_mode()
@@ -43,6 +44,11 @@ class CognitiveCore:
 
     async def start(self):
         print(f"[CORE] Starting Cognitive Core 0.1... (Build: {CORE_BUILD})")
+        if self.precedent_mode == "shadow":
+            # STEP 7a: the layer's cut-off, written once, before the adapter
+            # connects and any observation is written in this mode.
+            started_at = self.storage.ensure_precedent_layer_started()
+            print(f"[PRECEDENT] layer started at {started_at}")
         await self.load_classifiers()
         await self.load_adapters()
         print("[CORE] Ready")

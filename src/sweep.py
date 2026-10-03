@@ -8,8 +8,9 @@ Per device exactly one outcome:
     skipped (no_entities | missing_metadata) | unchanged | classified | no_match | error
 
 shadow: computes everything, writes only the classification_sweeps row.
-active: additionally writes classification_inputs + observations (one
-        transaction per device) and refreshes review cases.
+active: additionally writes classification_inputs, observations, review
+        cases and (STEP 7a, when enabled) precedent annotations - one
+        transaction per device.
 """
 
 import copy
@@ -127,7 +128,8 @@ class ObservationSweep:
         return dict(entry, input_id=written[0]), written[1]
 
     def _persist(self, device_input, fp, entry, results, sweep_id) -> tuple:
-        """Active mode: input + observations atomically, then review cases."""
+        """Active mode: input, observations, review cases and precedent
+        annotations in one transaction (Storage.record_classification)."""
         snapshot = device_input.snapshot
         now = _now()
         input_id = f"inp_{uuid4().hex[:12]}"
@@ -146,7 +148,7 @@ class ObservationSweep:
             "device_entity_count": len(snapshot["entities"]),
         } for name in entry["matched_classifiers"]]
 
-        observation_ids = self.storage.record_classification_input({
+        observation_ids = self.storage.record_classification({
             "id": input_id, "device_id": device_input.device_id, "fingerprint": fp,
             "classifier_set_version": self.version,
             "snapshot_json": canonical_json(snapshot),
@@ -154,20 +156,6 @@ class ObservationSweep:
             "matched_classifiers": entry["matched_classifiers"],
             "sweep_id": sweep_id, "created_at": now,
         }, observations)
-
-        # Review cases are derived state: the input and observations are
-        # already committed, so a failure here must not turn the outcome
-        # into an error. Storage.backfill_review_cases() reconciles review
-        # cases from observation history on the next start.
-        try:
-            for obs, observation_id in zip(observations, observation_ids):
-                self.storage.upsert_review_case(
-                    device_id=obs["device_id"], classifier_name=obs["classifier_name"],
-                    hypothesis_category=obs["hypothesis_category"],
-                    observation_id=observation_id)
-        except Exception as exc:
-            print(f"[SWEEP] WARNING: review case refresh failed for "
-                  f"{device_input.device_id}: {exc!r} (reconciled on next start)")
         return input_id, len(observation_ids)
 
 

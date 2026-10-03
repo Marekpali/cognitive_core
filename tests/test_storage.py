@@ -254,8 +254,12 @@ def test_resolve_refuses_to_overwrite_already_labelled_observation(temp_storage)
     # methods) must not have that decision overwritten by the dual-write.
     obs = _obs(temp_storage, "g1", "dev1", "env", "environmental")
     case_id = temp_storage.upsert_review_case("dev1", "env", "environmental", obs)
-    with pytest.warns(DeprecationWarning):
-        assert temp_storage.approve_observation(obs) == "resolved"
+    # Since STEP 7a the legacy methods delegate to the resolver, so this
+    # state can only come from outside the code: label the row directly.
+    conn = temp_storage.connect()
+    conn.execute("UPDATE classification_observations SET review_status = 'reviewed', "
+                 "human_decision = 'approved' WHERE id = ?", (obs,))
+    conn.commit()
 
     with pytest.raises(RuntimeError):
         temp_storage.resolve_review_case(
@@ -498,6 +502,14 @@ def _obs_decision(temp_storage, obs_id):
     return dict(row)
 
 
+def _pending_obs(temp_storage):
+    """An observation that is the current evidence of a pending case - the
+    only thing the legacy methods may decide since STEP 7a."""
+    obs = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    temp_storage.upsert_review_case("dev1", "env", "environmental", obs)
+    return obs
+
+
 def _legacy_decide(temp_storage, obs_id, decision):
     """Call the legacy method for decision ('approved'|'rejected'|'corrected')."""
     with pytest.warns(DeprecationWarning):
@@ -510,7 +522,7 @@ def _legacy_decide(temp_storage, obs_id, decision):
 
 @pytest.mark.parametrize("decision", ["approved", "rejected", "corrected"])
 def test_legacy_first_decision_succeeds(temp_storage, decision):
-    obs = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    obs = _pending_obs(temp_storage)
     result = _legacy_decide(temp_storage, obs, decision)
     assert result == "resolved"
     assert result  # truthy on success, as the old bool contract was
@@ -526,7 +538,7 @@ def test_legacy_first_decision_succeeds(temp_storage, decision):
     ("rejected", "approved"),
 ])
 def test_legacy_second_decision_is_refused_and_changes_nothing(temp_storage, first, second):
-    obs = _obs(temp_storage, "g1", "dev1", "env", "environmental")
+    obs = _pending_obs(temp_storage)
     _legacy_decide(temp_storage, obs, first)
     before = _obs_decision(temp_storage, obs)
 
@@ -560,5 +572,6 @@ def test_decision_result_truth_values():
     assert bool(DecisionResult("resolved")) is True
     assert bool(DecisionResult("already_resolved")) is False
     assert bool(DecisionResult("not_found")) is False
+    assert bool(DecisionResult("not_reviewable")) is False
     # Documented compatibility boundary: direct bool comparison is NOT supported.
     assert (DecisionResult("resolved") == True) is False  # noqa: E712

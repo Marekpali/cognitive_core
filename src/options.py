@@ -37,3 +37,35 @@ def read_observation_mode(options_path: Path = OPTIONS_PATH) -> str:
         mode, source = DEFAULT_OBSERVATION_MODE, "fallback"
     print(f"[OPTIONS] observation_mode={mode} (source: {source})")
     return mode
+
+
+DEFAULT_PRECEDENT_MODE = "off"
+PRECEDENT_MODES = ("off", "shadow")
+
+
+def read_precedent_mode(options_path: Path = OPTIONS_PATH, announce: bool = True) -> str:
+    """STEP 7a: `precedent_mode` from /data/options.json, then the
+    PRECEDENT_MODE environment variable. Missing, unreadable or unknown
+    means "off": the precedent layer must be switched on explicitly."""
+    raw = None
+    source = "default"
+    try:
+        if options_path.exists():
+            raw = json.loads(options_path.read_text(encoding="utf-8")).get("precedent_mode")
+            source = str(options_path)
+    except (OSError, ValueError, AttributeError) as exc:
+        print(f"[OPTIONS] WARNING: cannot read {options_path}: {exc!r}")
+    if raw is None and os.getenv("PRECEDENT_MODE"):
+        raw, source = os.getenv("PRECEDENT_MODE"), "PRECEDENT_MODE"
+
+    if raw is None:
+        mode = DEFAULT_PRECEDENT_MODE
+    elif raw in PRECEDENT_MODES:
+        mode = raw
+    else:
+        print(f"[OPTIONS] WARNING: unknown precedent_mode {raw!r} from {source}; "
+              f"using {DEFAULT_PRECEDENT_MODE!r}")
+        mode, source = DEFAULT_PRECEDENT_MODE, "fallback"
+    if announce:
+        print(f"[OPTIONS] precedent_mode={mode} (source: {source})")
+    return mode

@@ -14,5 +14,7 @@ map:
     read_only: true
 options:
   observation_mode: shadow
+  precedent_mode: "off"
 schema:
   observation_mode: list(shadow|active)
+  precedent_mode: list(off|shadow)

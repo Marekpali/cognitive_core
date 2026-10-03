@@ -31,6 +31,7 @@ def d1_era_schema(monkeypatch):
     schema by switching off the STEP 7P additions (tables, input_id,
     5 triggers); tests of the post-7P schema live in test_d2_verify.py."""
     monkeypatch.setattr(Storage, "init_step7p_schema", lambda self, cursor: None)
+    monkeypatch.setattr(Storage, "init_step7a_schema", lambda self, cursor: None)
 
 
 @pytest.fixture

@@ -238,6 +238,15 @@ def show_correction_patterns():
         print(f"  corrected to: {p['corrected_category']}")
         print(f"  {p['correction_count']} of {p['sample_size']} reviewed case(s)")
         print()
+def show_precedent_report():
+    """CLI: STEP 7a precedent annotations measured against human decisions.
+    Read-only. Annotations are never shown in the `review` command."""
+    from src.precedent_report import build_report, render
+
+    storage = Storage()
+    print(render(build_report(storage.connect())))
+
+
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         command = sys.argv[1]
@@ -250,6 +259,8 @@ if __name__ == '__main__':
             show_review_stats()
         elif command == 'correction-patterns':
             show_correction_patterns()
+        elif command == 'precedent-report':
+            show_precedent_report()
     else:
         core = CognitiveCore()
         try:

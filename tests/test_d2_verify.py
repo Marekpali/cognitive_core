@@ -24,6 +24,14 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "d2_verify.py"
 
 
+@pytest.fixture(autouse=True)
+def _step7p_era(monkeypatch):
+    """This verifier belongs to the STEP 7P-era database: build the test
+    databases without the STEP 7a tables and triggers (which it would,
+    correctly, report as unexpected)."""
+    monkeypatch.setattr(Storage, "init_step7a_schema", lambda self, cursor: None)
+
+
 def _d1_era(fn):
     original = Storage.init_step7p_schema
     Storage.init_step7p_schema = lambda self, cursor: None
@@ -116,23 +124,30 @@ def test_negative_control_fails_only_in_d2(dbs):
     assert "missing table classification_inputs" in result.stdout
 
 
+# Since STEP 7a the resolver checks the status explicitly before its guarded
+# UPDATE; a D0 regression needs both lines of defence gone.
+NO_STATUS_CHECK = ("if row['status'] != 'pending':", "if False:")
+
+
 def _deployed_without(tmp_path, *guards) -> Path:
-    """A copy of src/ whose storage.py lacks the given D0 guard snippets."""
+    """A copy of src/ whose storage.py lacks the given D0 guard snippets
+    (a string is removed, an (old, new) pair is replaced)."""
     fake_root = tmp_path / "fake"
     shutil.copytree(REPO / "src", fake_root / "src",
                     ignore=shutil.ignore_patterns("__pycache__"))
     storage_py = fake_root / "src" / "storage.py"
     text = storage_py.read_text(encoding="utf-8")
     for guard in guards:
-        assert guard in text
-        text = text.replace(guard, "")
+        old, new = guard if isinstance(guard, tuple) else (guard, "")
+        assert old in text
+        text = text.replace(old, new)
     storage_py.write_text(text, encoding="utf-8")
     return fake_root
 
 
 def test_d0_regression_in_deployed_code_is_detected(dbs, tmp_path):
-    """Deployed code without both D0 guards overwrites a decision -> D0 FAIL."""
-    fake = _deployed_without(tmp_path, " AND status = 'pending'",
+    """Deployed code without the D0 guards overwrites a decision -> D0 FAIL."""
+    fake = _deployed_without(tmp_path, NO_STATUS_CHECK, " AND status = 'pending'",
                              " AND human_decision IS NULL")
     result = _run(dbs, src_root=fake)
     assert result.returncode == 1
@@ -142,9 +157,9 @@ def test_d0_regression_in_deployed_code_is_detected(dbs, tmp_path):
 
 
 def test_crashing_check_is_reported_as_section_fail(dbs, tmp_path):
-    """Only the case guard removed: the observation guard raises instead of
+    """Only the case guards removed: the observation guard raises instead of
     returning 'already_resolved'. Reported as D0 FAIL; other sections run."""
-    fake = _deployed_without(tmp_path, " AND status = 'pending'")
+    fake = _deployed_without(tmp_path, NO_STATUS_CHECK, " AND status = 'pending'")
     result = _run(dbs, src_root=fake)
     sections = _sections(result.stdout)
     assert sections["D0"] == "FAIL" and sections["D1"] == "PASS"

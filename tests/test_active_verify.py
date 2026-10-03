@@ -31,6 +31,14 @@ spec.loader.exec_module(verify)
 ALL = ("D0", "D1", "D2", "PINS", "DATA", "ACTIVE", "REPEAT")
 
 
+@pytest.fixture(autouse=True)
+def _step7p_era(monkeypatch):
+    """This verifier belongs to the STEP 7P-era database: build the test
+    databases without the STEP 7a tables and triggers (which it would,
+    correctly, report as unexpected)."""
+    monkeypatch.setattr(Storage, "init_step7a_schema", lambda self, cursor: None)
+
+
 def _sweep(path: Path, mode: str, snapshot=None, source="startup"):
     storage = Storage(path)
     result = asyncio.run(ObservationSweep(storage, _classifiers(), mode).run(
