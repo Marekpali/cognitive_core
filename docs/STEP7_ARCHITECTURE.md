@@ -220,8 +220,11 @@ never be annotated and never become verifiable. For those, and only
 those:
 
 - *Eligible:* a `pending` case whose `expected_observation_id` row was
-  created before `precedent_layer_started_at` (persisted once, on the
-  first enabled start) and has no class-pattern annotation.
+  created before `precedent_layer_started_at` and has no class-pattern
+  annotation. `precedent_layer_started_at` is the durable cut-off of the
+  layer: written **once**, in the database, on the first enabled start;
+  it survives restarts and is immutable afterwards (where it is stored is
+  left to the implementation plan).
 - *When:* inside `resolve_review_case()`, on the first effective
   `pending → resolved`: **after** the `expected_observation_id` (stale)
   check and the pending guard pass, **before** the human decision is
@@ -230,17 +233,34 @@ those:
   (`decided_at < annotation.created_at`). The decision being recorded can
   never be evidence for its own annotation; its `decided_at` is strictly
   later than `annotation.created_at` (enforced in code, tested).
-- *Atomicity:* annotation, evidence rows and the human decision are
-  written in **one transaction** — both or neither.
+- *Human decision > precedent annotation.* The annotation is computed
+  before the decision is written and stored in the **same transaction,
+  inside a `SAVEPOINT`**. If computing or writing the annotation or its
+  evidence fails, only the savepoint is rolled back: **the human decision
+  is still committed**. The annotation is all-or-nothing — never a
+  partial annotation or evidence set. Such a case stays without a
+  bootstrap annotation for good (no later backfill) and is recorded as
+  `annotation_failed`.
+- *`annotation_failed` is an audit state, not a kind of annotation.* It
+  is a durable record (case, observation, error class, time) kept
+  outside the annotation tables and counted in the report;
+  `annotation_trigger` keeps exactly two values, `observation` and
+  `bootstrap_pending`. Writing the audit record must not be able to
+  block the decision either.
 - *Memory type:* class pattern only. A pending case has no resolved
   precedent for its own key, so there is no device precedent to recall.
+- *No evidence is not a failure.* If no earlier decision exists for the
+  case's `(classifier_name, hypothesis_category)` on other devices
+  (`sample_size = 0`), no annotation is written, as on the normal path;
+  that is not `annotation_failed`.
 - *Blind review holds:* the annotation is created after the reviewer has
   entered the decision and is never displayed.
 
-Consequence: resolving the legacy cases one after another lets case #2
-use the decision on #1, #3 use #1–#2, and so on, instead of all of them
-sharing one frozen picture built from the two decisions that existed
-before 7a.
+Consequence: among legacy cases that share a
+`(classifier_name, hypothesis_category)`, resolving them one after another
+lets the second use the decision on the first, the third use the first
+two, and so on, instead of all of them sharing one frozen picture built
+from the two decisions that existed before 7a.
 
 **The bootstrap cohort is not the normal temporal cohort.** Its evidence
 cut-off lies at decision time, later than the observation, so these
@@ -248,8 +268,17 @@ annotations do not show what Core knew *when it observed*. They carry
 their own `annotation_trigger` value and are reported in their own
 section; they are never merged into the figures of the normal cohort.
 
-Decisions made through the deprecated legacy methods
-(`approve_observation()` etc.) get no bootstrap annotation.
+### One canonical resolver — no bypass
+
+After 7a is deployed, **every production path from `pending` to
+`resolved` goes through `resolve_review_case()`**. The deprecated
+`approve_observation()` / `reject_observation()` / `correct_observation()`
+must either delegate to it or not be reachable as a production resolution
+path. Otherwise a decision could be recorded without the bootstrap step
+and silently fall out of the 7a data. (Today the `review` CLI in
+`src/main.py` calls only `resolve_review_case()`; the legacy methods
+still write decisions with their own SQL.) A test proves there is no
+bypass.
 
 ---
 
@@ -270,7 +299,10 @@ behind 1 human judgment). Therefore:
 
 ## Data model
 
-New table, no changes to existing tables except the immutability trigger:
+Two new tables; existing tables are not changed (their immutability
+triggers are in production since D1/D2). Where the layer's cut-off and
+the `annotation_failed` audit record are stored is left to the
+implementation plan (open question 4).
 
 ```sql
 CREATE TABLE precedent_annotations (
@@ -430,13 +462,13 @@ including the `RuntimeError` integrity check shared with
 never a lost observation or input, a missed review case, a device
 outcome of `error`, or a stalled sweep.
 
-**Bootstrap path.** Deliberately different: annotation and decision share
-one transaction, so a failing annotator means the decision is **not**
-recorded either (refused with a clear message, nothing written, the case
-stays `pending`). A human decision is never lost silently and never
-recorded with a half-written annotation. The way out is the kill switch:
-with the layer off, `resolve_review_case()` behaves exactly as before 7a
-and writes no annotation.
+**Bootstrap path.** Same principle, different mechanism: the annotation
+shares the decision's transaction but lives in its own `SAVEPOINT`. A
+failure rolls back the savepoint only; the human decision is committed,
+nothing partial remains, and the case is recorded as `annotation_failed`
+(see *When an annotation is written*). Precedent memory is information
+without authority: on no path can it stop, delay or alter a human
+decision.
 
 Performance: evidence is small today, so direct SQL per observation is
 acceptable in 7a. Caching is deferred until measured as necessary
@@ -451,7 +483,7 @@ Separate sections, never merged: device precedent, class pattern
 (normal cohort, `annotation_trigger = 'observation'`), and class pattern
 — bootstrap cohort (`'bootstrap_pending'`, same metrics, own table, with a
 note that its evidence cut-off is the decision time, not the observation
-time).
+time, plus the number of legacy cases resolved as `annotation_failed`).
 
 **Device precedent (recall):**
 
@@ -526,13 +558,17 @@ ratios, not only the headline metrics.
 7. Annotator failure (incl. integrity `RuntimeError`) on the normal path
    is tested not to affect inputs, observations, review cases, sweep
    outcomes/counts, or the HA handler.
-7a. Bootstrap: tests prove (i) annotation + decision are atomic — a
-   failing annotator leaves the case `pending` and writes nothing;
-   (ii) the decision being recorded is never in its own evidence;
-   (iii) resolving legacy cases in sequence grows the evidence of the
-   later ones; (iv) a stale or already-resolved call writes no
-   annotation; (v) only eligible legacy cases are bootstrapped;
-   (vi) with the layer off nothing is annotated and resolution works.
+7a. Bootstrap: tests prove (i) a failing annotator (while computing,
+   and while writing the annotation or its evidence) leaves the human
+   decision committed, **no** partial annotation or evidence row, and an
+   `annotation_failed` audit record; (ii) the decision being recorded is
+   never in its own evidence; (iii) resolving legacy cases in sequence
+   grows the evidence of the later ones; (iv) a stale or already-resolved
+   call writes no annotation; (v) only eligible legacy cases are
+   bootstrapped, and the cut-off `precedent_layer_started_at` is written
+   once and unchanged by a restart; (vi) with the layer off nothing is
+   annotated and resolution works; (vii) no bypass: every production
+   path `pending → resolved` passes the canonical resolver.
 7b. An existing annotation is never refreshed: later decisions leave it
    byte-identical (and the triggers refuse UPDATE/DELETE).
 8. `precedent-report` implements the metrics above, with separate
@@ -569,9 +605,10 @@ ratios, not only the headline metrics.
    backup API inside the container, copied out with `docker cp` / read
    over Samba (D0–D2).
 3. ~~Re-resolution of resolved cases.~~ **Closed by D0:** refused.
-4. **Where `precedent_layer_started_at` is stored** (it decides bootstrap
-   eligibility and must be written once and not be editable). To be
-   settled in the implementation plan.
+4. **Physical storage of `precedent_layer_started_at` and of the
+   `annotation_failed` audit record.** Semantics are fixed above (written
+   once / durable, immutable, append-only); the form is settled in the
+   implementation plan.
 
 ## Revision 2026-10-03 (after STEP 7P; no implementation yet)
 
@@ -592,7 +629,13 @@ and the report are unchanged. Changed:
 7. Precondition `7p-active`; deployment as a FULL GATE on the D2 pattern.
 8. **Bootstrap exception for legacy pending cases** (decided 2026-10-03):
    annotation created inside `resolve_review_case()` immediately before
-   the first decision, in one transaction, evidence = earlier decisions
-   only; own `annotation_trigger`, own report section. Stated explicitly:
+   the first decision, evidence = earlier decisions only; own
+   `annotation_trigger`, own report section. Stated explicitly:
    **no backfill for resolved cases, no refresh of an existing
    annotation, bootstrap cohort ≠ normal temporal cohort.**
+9. **Human decision > precedent annotation**: the bootstrap annotation is
+   written in a `SAVEPOINT` of the decision's transaction; its failure
+   never blocks the decision, leaves nothing partial and is audited as
+   `annotation_failed` (an audit state, not an `annotation_trigger`).
+10. **One canonical resolver**: no production resolution path may bypass
+    `resolve_review_case()`; legacy methods delegate or are unreachable.
