@@ -254,8 +254,10 @@ registry events. Tag `d2-deployed` (= deployed in shadow).
 
 ## Next
 
-1. After ≥ 1 daily shadow sweep with a baseline ≥ 20 h older:
-   `shadow_check.py` again.
+1. `shadow_check.py` again. (S4 was amended on 2026-10-03 — see
+   `STEP7_OBSERVATION_SOURCES.md` §10.2: a continuous ≥ 20 h window of
+   identical fingerprints, any sweep source; the `daily`-sweep wording
+   above is the criterion as it stood on the day of deployment.)
 2. All S1–S6 MET → lightweight FULL GATE, explicit **GO** →
    `observation_mode: active` in the add-on UI → restart → own attestation
    and tag `7p-active`.

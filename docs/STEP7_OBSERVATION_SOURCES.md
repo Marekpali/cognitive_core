@@ -248,7 +248,7 @@ per device and re-computed observations; resolved cases still do not reopen
 | Source | Trigger | Action |
 |---|---|---|
 | A — startup | add-on start | full sweep |
-| A — daily | every 24 h | full sweep |
+| A — daily | 24 h after the last completed sweep of any source | full sweep |
 | existing | `device_registry_updated` | debounced full sweep |
 | B | `entity_registry_updated` | debounced full sweep |
 
@@ -292,7 +292,7 @@ Gate baseline per device:
 
 Because each row stores both the fingerprint it computed and the baseline
 fingerprint it compared against, every `unchanged` decision — and therefore
-S4 — can be re-checked later from two stored rows, without re-running the
+S4 — can be re-checked later from the stored rows, without re-running the
 sweep. Size: ~160 entries ≈ tens of KB per sweep.
 
 Nothing is lost while in shadow: a registry change during shadow is caught
@@ -374,14 +374,34 @@ addendum to it).
 - **S3** Classified set matches Probe 7P's corrected result (18 devices, 20
   matches, 4 motion), except differences explained by registry changes since
   the probe.
-- **S4** Two consecutive shadow sweeps with no registry change between
-  them (at least one daily sweep, i.e. thousands of state changes apart):
-  **100 % `unchanged`**, verified from the stored rows: every device's
-  `fingerprint` equals its `baseline_fingerprint` (§8).
+- **S4** *(amended 2026-10-03, see below)* A continuous window of **at
+  least 20 h** between two shadow sweeps, of any source, in which **every**
+  fingerprinted device keeps an identical fingerprint in **every** sweep of
+  the window and is gated `unchanged` (thousands of state changes apart).
+  Registry changes outside that window (devices added, removed, or with a
+  changed fingerprint) do not invalidate S4, but each must be re-evaluated
+  without error and every stored gate decision must be consistent:
+  `unchanged` only where `fingerprint` equals `baseline_fingerprint`, a
+  re-evaluation only where it differs, and `baseline_fingerprint` equal to
+  what the baseline sweep stored (§8). Devices whose fingerprint changed
+  more than once are reported as a diagnostic, not a failure.
 - **S5** `skipped/missing_metadata` ≤ 5 % of devices with entities, each
   listed; above that → decide on the §5.2 fallback before activation.
 - **S6** Row counts of `classification_observations`, `review_cases`,
   human-decision columns and `classification_inputs` unchanged during shadow.
+
+**S4 amendment (2026-10-03).** The original wording required a `daily`
+sweep whose baseline was at least 20 h older. The daily sweep runs 24 h
+after the last sweep of *any* source, and its baseline is always the
+previous sweep, so on an instance whose registry emits events every few
+hours the criterion could never be met although the gate worked: production
+shadow data showed 25 sweeps in 60 h, none `daily`, longest gap 14.5 h. The
+property S4 exists to prove — fingerprints do not move while states change —
+is measured directly by the window above and does not depend on the sweep
+source. The standard is not lowered: the window must be continuous, cover
+every device, and every gate decision in the whole period is re-checked.
+S3 is tightened at the same time: the *effective* result (each device's
+latest evaluation) must match the probe too, not only the startup sweep.
 
 If S1–S6 hold: explicit GO, then `observation_mode: active` (activation,
 lightweight FULL GATE, §8). If not: fix,
