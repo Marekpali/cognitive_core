@@ -1,7 +1,8 @@
 # STEP 7P activation — shadow → active
 
-**Status:** PROCEDURE — prepared 2026-10-03. Nothing activated. Production
-runs `8570f77` in `observation_mode: shadow` (`d2-deployed`).
+**Status:** Activation verified — PASS. Production runs `8570f77` in
+`observation_mode: active` since 2026-10-03.
+**Verification:** `active_verify.py` @ `fa2151e` — `RESULT: PASS`.
 **Gate:** FULL GATE — lightweight, single decision. No code, no rebuild:
 one add-on option and a restart. First production-changing operation:
 Phase A4, only after an explicit **GO**.
@@ -204,8 +205,102 @@ repeat the `docker cp` of Phase A6 first.
 
 ## Phase A8 — attestation
 
-This document becomes the attestation with the observed values, is
-committed, and only then tagged `7p-active`.
+This document is the attestation (observed values below); committed, and
+only then tagged `7p-active`.
+
+---
+
+## Observed results (2026-10-03)
+
+**A0** `active_verify.py: OK`, `d2_verify.py: OK`.
+**A1** deployed files equal `8570f77` (hashes printed by the verifier:
+`storage.py 29a756d0…`, `core.py d0feedc4…`, `main.py 8a767304…`,
+`adapters/ha.py 032744f3…`); options `shadow`; `find` → only `config.yaml`.
+**A2** `pre_active.db`
+`9e6bdc566696b89d712fb8d0b338b8e502c82d45c3535b3415165589eacb625a`
+(1 339 392 bytes) — identical in the container, on the host and read over
+Samba.
+
+**A3 — negative control:** D0, D1 (13/13, 13/13), D2 (5/5, 5/5), PINS
+(17/17), DATA `PASS`; `ACTIVE FAIL — no active sweep since the snapshot`;
+`REPEAT PENDING`; `RESULT: FAIL`. Baseline:
+
+```
+classification_observations 11   review_cases 2 (both resolved)
+classification_inputs 0          classification_sweeps 27 (all shadow)
+assets 13                        review_queue 9
+```
+
+**A4 — activation** (explicit GO given after A3): option set to `active`
+in the UI, app restarted. `/data/options.json` =
+`{"observation_mode": "active"}`; log
+`[OPTIONS] observation_mode=active (source: /data/options.json)`; no
+`Traceback`.
+
+**A6/A7 — `active_verify.py`:**
+
+```
+D0      PASS   2 resolved cases re-decided on a copy; decision fields identical
+D1      PASS   13/13 triggers, 13/13 exact refusals
+D2      PASS   5/5 triggers, no unexpected trigger, 5/5 exact refusals
+PINS    PASS   17/17
+DATA    PASS   every snapshot row present and identical; review_cases: 2 pointers
+               advanced; pre-activation observations with input_id: 0
+ACTIVE  PASS
+REPEAT  PASS
+RESULT: PASS
+```
+```
+classification_observations  11 -> 31   (+20)
+review_cases                  2 -> 20   (+18)
+classification_inputs         0 -> 145  (+145)
+classification_sweeps        27 -> 31   (+4: 1 shadow, 3 active)
+assets                       13 -> 13
+
+sweep swp_11076e0fd111 active startup: discovered 159, evaluated 145 (classified 18), unchanged 0,   error 0, inputs written 145
+sweep swp_66493860d173 active startup: discovered 159, evaluated 0   (classified 0),  unchanged 145, error 0, inputs written 0
+sweep swp_8d33d9c86651 active startup: discovered 159, evaluated 0   (classified 0),  unchanged 145, error 0, inputs written 0
+new observations: 20; expected from new inputs: 20
+review cases: 18 new (all pending), 2 existing advanced to new evidence
+resolved in snapshot: 2; still resolved with identical decision fields: 2
+later active sweeps: 2; with nothing evaluated or written: 2
+```
+
+The production result equals the rehearsal in every derived number
+(+20 observations, 18 new pending cases, 2 decided cases kept) and Probe 7P
+(18 classified devices, 20 matches).
+
+### Deviations from the procedure
+
+1. **A3 was first run before A2**: the verifier stopped with
+   `unable to open database file` (no `pre_active.db` yet). Read-only, no
+   effect. Follow-up: report a missing snapshot as a clear message instead
+   of a traceback (not changed during the gate, to keep the package hash).
+2. **First restart before the option was saved**: one extra shadow startup
+   sweep (`swp_48405354f0eb`, 145/145 unchanged). Harmless; the verifier
+   allows shadow sweeps between the snapshot and the first active sweep.
+3. **Three active startup sweeps instead of one.** Saving the option in the
+   UI restarted the app (first active sweep, `swp_11076e0fd111`), and the
+   app was restarted again afterwards. `docker logs` only shows the current
+   container, so Phase A5 displayed the third sweep (`unchanged=145`)
+   rather than the first; the stored rows show the full sequence.
+   Consequence: REPEAT was satisfied at once, by restart-triggered sweeps
+   rather than by a later registry event. They run the same gated sweep
+   code, so the property — same fingerprint → `unchanged` → nothing written
+   — is demonstrated twice; no sweep was triggered for that purpose.
+
+## Conclusion
+
+STEP 7P is **active** in production: every device with entities has a
+stored input and fingerprint, 18 devices carry 20 observations linked to
+their inputs, 18 hypotheses await human review, and both earlier human
+decisions are intact. D0, D1 and D2 protections still hold. Tag
+`7p-active`.
+
+## Next
+
+STEP 7a (`docs/STEP7_ARCHITECTURE.md`), then the behavioural-evidence ADR.
+Review cases may be decided from now on.
 
 ---
 
